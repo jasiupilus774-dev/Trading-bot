@@ -13,7 +13,25 @@ from datetime import datetime
 import ccxt
 import pandas as pd
 import ta
+def load_state(pairs):
+    if os.path.exists(STATE_PATH):
+        with open(STATE_PATH, "r") as f:
+            return json.load(f)
+    # domyślny stan: brak pozycji
+    return {p: {"in_pos": False, "entry": None, "qty": 0.0, "last_action_ts": None} for p in pairs}
 
+def save_state(state):
+    with open(STATE_PATH, "w") as f:
+        json.dump(state, f)
+
+def append_trade(row: dict):
+    file_exists = os.path.exists(TRADES_CSV)
+    with open(TRADES_CSV, "a", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=list(row.keys()))
+        if not file_exists:
+            w.writeheader()
+        w.writerow(row)
+        
 # =========================
 # KONFIGURACJA
 # =========================
@@ -160,7 +178,59 @@ def sell(exchange, pair):
 def run_bot():
     log.info("🤖 Bot startuje")
     exchange = connect_binance()
+state = load_state(PAIRS)
+pos = state[pair]
 
+# ===== PAPER BUY =====
+if signal == "BUY" and not pos["in_pos"]:
+    usdt = get_balance(exchange, "USDT")
+    if usdt >= TRADE_AMOUNT_USDT:
+        entry_price = price
+        qty = TRADE_AMOUNT_USDT / entry_price
+
+        pos["in_pos"] = True
+        pos["entry"] = entry_price
+        pos["qty"] = qty
+        pos["last_action_ts"] = datetime.utcnow().isoformat()
+
+        append_trade({
+            "ts": pos["last_action_ts"],
+            "pair": pair,
+            "side": "BUY_PAPER",
+            "price": entry_price,
+            "qty": qty,
+            "rsi": float(rsi),
+        })
+
+        log.info(f"🧾 PAPER BUY {pair} @ {entry_price:.2f} qty={qty:.6f}")
+        save_state(state)
+
+# ===== PAPER SELL =====
+elif signal == "SELL" and pos["in_pos"]:
+    exit_price = price
+    qty = pos["qty"]
+    entry = pos["entry"]
+
+    pnl = (exit_price - entry) * qty
+
+    append_trade({
+        "ts": datetime.utcnow().isoformat(),
+        "pair": pair,
+        "side": "SELL_PAPER",
+        "price": exit_price,
+        "qty": qty,
+        "entry": entry,
+        "pnl": pnl,
+        "rsi": float(rsi),
+    })
+
+    log.info(f"🧾 PAPER SELL {pair} @ {exit_price:.2f} PnL={pnl:.4f}")
+
+    pos["in_pos"] = False
+    pos["entry"] = None
+    pos["qty"] = 0.0
+    pos["last_action_ts"] = datetime.utcnow().isoformat()
+    save_state(state)
     while True:
         log.info(f"🔍 {datetime.now().strftime('%H:%M:%S')} — sprawdzam sygnały")
 
