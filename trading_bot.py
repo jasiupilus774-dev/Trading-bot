@@ -1,4 +1,26 @@
 """
+import os
+from binance.client import Client
+
+API_KEY = os.getenv("BINANCE_API_KEY")
+API_SECRET = os.getenv("BINANCE_API_SECRET")
+BASE_URL = os.getenv("BINANCE_BASE_URL", "https://testnet.binance.vision")
+
+if not API_KEY or not API_SECRET:
+    raise RuntimeError("Brak BINANCE_API_KEY lub BINANCE_API_SECRET")
+
+client = Client(API_KEY, API_SECRET)
+
+# Wymuszenie TESTNET (krytyczne)
+client.API_URL = f"{BASE_URL}/api"
+
+print("BASE_URL:", BASE_URL)
+print("PING:", client.ping())
+print("SERVER TIME:", client.get_server_time())
+
+acct = client.get_account()
+balances = [b for b in acct["balances"] if float(b["free"]) > 0 or float(b["locked"]) > 0]
+print("NON-ZERO BALANCES:", balances)
 Crypto Trading Bot — BTC/USDT & ETH/USDT
 Strategia: RSI + MACD | Giełda: Binance
 """
