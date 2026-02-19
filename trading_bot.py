@@ -1,4 +1,11 @@
-import os
+import json
+import csv
+
+STATE_PATH = "bot_state.json"
+TRADES_CSV = "trades.csv"
+
+FEE_RATE = float(os.getenv("FEE_RATE", "0.001"))  # 0.1%
+SLIPPAGE_RATE = float(os.getenv("SLIPPAGE_RATE", "0.0002"))  # 0.02% konserwatywnieimport os
 import time
 import logging
 from datetime import datetime
