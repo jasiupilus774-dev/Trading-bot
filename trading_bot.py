@@ -19,8 +19,8 @@ CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "3600"))  # sekundy
 
 # RSI — pullbacki w trendzie
 RSI_PERIOD = int(os.getenv("RSI_PERIOD", "14"))
-RSI_BUY = float(os.getenv("RSI_BUY", "40"))   # BUY gdy RSI < ...
-RSI_SELL = float(os.getenv("RSI_SELL", "60")) # SELL gdy RSI > ...
+RSI_BUY = float(os.getenv("RSI_BUY", "40"))
+RSI_SELL = float(os.getenv("RSI_SELL", "60"))
 
 # MACD
 MACD_FAST = int(os.getenv("MACD_FAST", "12"))
@@ -33,18 +33,20 @@ EMA_SLOW = int(os.getenv("EMA_SLOW", "200"))
 
 # Risk/Reward
 RR = float(os.getenv("RR", "1.5"))
-SL_PCT = float(os.getenv("SL_PCT", "0.02"))         # 2%
+SL_PCT = float(os.getenv("SL_PCT", "0.02"))
 TP_PCT = float(os.getenv("TP_PCT", str(SL_PCT * RR)))
 
-# Paper trading + koszty
-DRY_RUN = os.getenv("DRY_RUN", "true").lower() == "true"  # na razie informacyjne (bo i tak paper)
+# Koszty symulacji
 FEE_RATE = float(os.getenv("FEE_RATE", "0.001"))          # 0.1%
 SLIPPAGE = float(os.getenv("SLIPPAGE_RATE", "0.0002"))    # 0.02%
 
-# Tryb pracy:
-# MODE=live -> pętla co godzinę (paper)
-# MODE=backtest -> jednorazowy backtest
-MODE = os.getenv("MODE", "live").lower()
+# Tryby:
+# MODE=paper   -> paper trading (CSV/state)
+# MODE=live    -> real orders on Binance testnet (spot)
+# MODE=backtest-> jednorazowy backtest
+MODE = os.getenv("MODE", "paper").lower()
+DRY_RUN = os.getenv("DRY_RUN", "true").lower() == "true"  # ma sens głównie w MODE=live
+
 BACKTEST_DAYS = int(os.getenv("BACKTEST_DAYS", "180"))
 
 # Dane na dysku (Railway Volume: ustaw DATA_DIR=/data)
@@ -65,16 +67,14 @@ def _default_pos():
     return {"in_pos": False, "entry": None, "qty": 0.0, "sl": None, "tp": None}
 
 def load_state(pairs):
+    data = {}
     if os.path.exists(STATE_PATH):
         try:
             with open(STATE_PATH, "r") as f:
                 data = json.load(f)
         except Exception:
             data = {}
-    else:
-        data = {}
 
-    # upewnij się, że wszystkie pary mają strukturę
     for p in pairs:
         data.setdefault(p, _default_pos())
     return data
@@ -87,7 +87,7 @@ def save_state(state):
 def append_trade(row):
     os.makedirs(os.path.dirname(TRADES_CSV) or ".", exist_ok=True)
     exists = os.path.exists(TRADES_CSV)
-    fields = ["ts", "pair", "side", "price", "qty", "entry", "sl", "tp", "gross", "fees", "pnl", "rsi", "trend"]
+    fields = ["ts", "pair", "side", "price", "qty", "entry", "sl", "tp", "gross", "fees", "pnl", "rsi", "trend", "mode"]
     with open(TRADES_CSV, "a", newline="") as f:
         w = csv.DictWriter(f, fieldnames=fields)
         if not exists:
@@ -111,16 +111,12 @@ def connect_binance():
         "enableRateLimit": True,
         "options": {"defaultType": "spot"},
     })
-
-    # Testnet spot
-    ex.set_sandbox_mode(True)
+    ex.set_sandbox_mode(True)  # TESTNET
 
     bal = ex.fetch_balance()
     usdt = bal["free"].get("USDT", 0)
-    log.info(f"✅ Połączono z Binance SPOT TESTNET")
+    log.info("✅ Połączono z Binance SPOT TESTNET")
     log.info(f"💰 TESTNET USDT balance: {usdt}")
-    log.info(f"🧪 DRY_RUN = {DRY_RUN}")
-    log.info(f"⚙️ fee={FEE_RATE} slippage={SLIPPAGE}")
     return ex
 
 # =========================
@@ -128,16 +124,13 @@ def connect_binance():
 # =========================
 def get_candles(ex, pair, limit=250):
     ohlcv = ex.fetch_ohlcv(pair, TIMEFRAME, limit=limit)
-    df = pd.DataFrame(ohlcv, columns=["ts", "open", "high", "low", "close", "volume"])
-    return df
+    return pd.DataFrame(ohlcv, columns=["ts", "open", "high", "low", "close", "volume"])
 
 def calculate_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
 
-    # RSI
     df["rsi"] = ta.momentum.RSIIndicator(df["close"], window=RSI_PERIOD).rsi()
 
-    # MACD
     macd = ta.trend.MACD(
         df["close"],
         window_fast=MACD_FAST,
@@ -147,7 +140,6 @@ def calculate_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df["macd"] = macd.macd()
     df["macd_signal"] = macd.macd_signal()
 
-    # EMA trend filter
     df["ema_fast"] = ta.trend.EMAIndicator(df["close"], window=EMA_FAST).ema_indicator()
     df["ema_slow"] = ta.trend.EMAIndicator(df["close"], window=EMA_SLOW).ema_indicator()
 
@@ -157,34 +149,27 @@ def calculate_indicators(df: pd.DataFrame) -> pd.DataFrame:
 # STRATEGIA
 # =========================
 def get_signal(df: pd.DataFrame):
-    # ważne: sygnały na zamknięciu świecy
     last = df.iloc[-1]
     prev = df.iloc[-2]
 
     rsi = float(last["rsi"])
-    price = float(last["close"])  # UJEDNOLICONA CENA: close świecy
+    price = float(last["close"])  # sygnały i zarządzanie na close świecy
 
-    # trend
     uptrend = price > float(last["ema_slow"]) and float(last["ema_fast"]) > float(last["ema_slow"])
     downtrend = price < float(last["ema_slow"]) and float(last["ema_fast"]) < float(last["ema_slow"])
     trend = "UP" if uptrend else "DOWN" if downtrend else "FLAT"
 
-    # MACD cross
     cross_up = float(prev["macd"]) < float(prev["macd_signal"]) and float(last["macd"]) > float(last["macd_signal"])
     cross_down = float(prev["macd"]) > float(prev["macd_signal"]) and float(last["macd"]) < float(last["macd_signal"])
 
-    # BUY: uptrend + pullback RSI + MACD cross up
     if uptrend and rsi < RSI_BUY and cross_up:
         return "BUY", rsi, trend, price
-
-    # SELL: downtrend + pullback RSI + MACD cross down
     if downtrend and rsi > RSI_SELL and cross_down:
         return "SELL", rsi, trend, price
-
     return "HOLD", rsi, trend, price
 
 # =========================
-# PAPER TRADING (SL/TP + koszty)
+# PAPER (symulacja)
 # =========================
 def paper_buy(state, pair, price, rsi, trend):
     entry = price * (1 + SLIPPAGE)
@@ -203,13 +188,14 @@ def paper_buy(state, pair, price, rsi, trend):
         "qty": qty,
         "sl": sl,
         "tp": tp,
-        "rsi": float(rsi),
-        "trend": trend
+        "rsi": rsi,
+        "trend": trend,
+        "mode": "paper"
     })
 
-    log.info(f"🟢 BUY {pair} @ {entry:.2f} | SL: {sl:.2f} | TP: {tp:.2f} | RSI: {rsi:.1f} | Trend:{trend}")
+    log.info(f"🧾 PAPER BUY {pair} @ {entry:.2f} | SL:{sl:.2f} TP:{tp:.2f} | RSI:{rsi:.1f} Trend:{trend}")
 
-def paper_sell(state, pair, price, rsi, trend, reason="SIGNAL"):
+def paper_sell(state, pair, price, rsi, trend, reason):
     pos = state[pair]
     exit_price = price * (1 - SLIPPAGE)
 
@@ -232,35 +218,64 @@ def paper_sell(state, pair, price, rsi, trend, reason="SIGNAL"):
         "gross": gross,
         "fees": fees,
         "pnl": pnl,
-        "rsi": float(rsi),
-        "trend": trend
+        "rsi": rsi,
+        "trend": trend,
+        "mode": "paper"
     })
 
-    log.info(f"🔴 SELL {pair} @ {exit_price:.2f} | PnL: {pnl:.4f} | Powód: {reason} | Trend:{trend}")
+    log.info(f"🧾 PAPER SELL {pair} @ {exit_price:.2f} | PnL:{pnl:.4f} | {reason}")
 
     state[pair] = _default_pos()
     save_state(state)
 
 # =========================
-# BACKTEST (na świecach close)
+# LIVE (prawdziwe zlecenia testnet)
+# =========================
+def live_buy(ex, pair, price, rsi, trend):
+    if DRY_RUN:
+        log.info(f"🟡 DRY_RUN: LIVE BUY {pair} pominięty")
+        return None
+
+    entry = price  # na testnecie i tak będzie po rynku; slippage liczymy w zarządzaniu/metrykach
+    qty = TRADE_AMOUNT_USDT / entry
+    qty = float(ex.amount_to_precision(pair, qty))
+
+    order = ex.create_market_buy_order(pair, qty)
+    log.info(f"🟢 LIVE BUY {pair} qty={qty} | order_id={order.get('id')}")
+    return order
+
+def live_sell(ex, pair):
+    if DRY_RUN:
+        log.info(f"🟡 DRY_RUN: LIVE SELL {pair} pominięty")
+        return None
+
+    base = pair.split("/")[0]
+    bal = ex.fetch_balance()["free"].get(base, 0)
+    if not bal or bal <= 0:
+        log.info(f"⚠️ LIVE: brak {base} do sprzedaży")
+        return None
+
+    qty = float(ex.amount_to_precision(pair, bal))
+    order = ex.create_market_sell_order(pair, qty)
+    log.info(f"🔴 LIVE SELL {pair} qty={qty} | order_id={order.get('id')}")
+    return order
+
+# =========================
+# BACKTEST
 # =========================
 def backtest_pair(df: pd.DataFrame, pair: str):
-    # symulacja jak w paper-trading: 1 pozycja na raz
     in_pos = False
     entry = qty = sl = tp = None
-
     trades = []
     equity = 0.0
     peak = 0.0
     max_dd = 0.0
 
-    # iterujemy od 2 świecy (bo macd cross używa prev)
     for i in range(2, len(df)):
         window = df.iloc[:i+1]
         sig, rsi, trend, price = get_signal(window)
 
         if in_pos:
-            # SL/TP
             if price <= sl:
                 exit_price = price * (1 - SLIPPAGE)
                 gross = (exit_price - entry) * qty
@@ -269,7 +284,6 @@ def backtest_pair(df: pd.DataFrame, pair: str):
                 equity += pnl
                 trades.append((df.iloc[i]["ts"], "SELL_SL", entry, exit_price, qty, pnl))
                 in_pos = False
-
             elif price >= tp:
                 exit_price = price * (1 - SLIPPAGE)
                 gross = (exit_price - entry) * qty
@@ -278,7 +292,6 @@ def backtest_pair(df: pd.DataFrame, pair: str):
                 equity += pnl
                 trades.append((df.iloc[i]["ts"], "SELL_TP", entry, exit_price, qty, pnl))
                 in_pos = False
-
             elif sig == "SELL":
                 exit_price = price * (1 - SLIPPAGE)
                 gross = (exit_price - entry) * qty
@@ -287,7 +300,6 @@ def backtest_pair(df: pd.DataFrame, pair: str):
                 equity += pnl
                 trades.append((df.iloc[i]["ts"], "SELL_SIGNAL", entry, exit_price, qty, pnl))
                 in_pos = False
-
         else:
             if sig == "BUY":
                 entry = price * (1 + SLIPPAGE)
@@ -297,12 +309,9 @@ def backtest_pair(df: pd.DataFrame, pair: str):
                 in_pos = True
                 trades.append((df.iloc[i]["ts"], "BUY", entry, None, qty, 0.0))
 
-        # drawdown tracking
         peak = max(peak, equity)
-        dd = equity - peak
-        max_dd = min(max_dd, dd)
+        max_dd = min(max_dd, equity - peak)
 
-    # metryki
     pnl_list = [t[5] for t in trades if str(t[1]).startswith("SELL")]
     wins = [p for p in pnl_list if p > 0]
     losses = [p for p in pnl_list if p < 0]
@@ -315,7 +324,6 @@ def backtest_pair(df: pd.DataFrame, pair: str):
     expectancy = (sum(pnl_list) / round_trips) if round_trips else 0.0
     net_pnl = sum(pnl_list)
 
-    # zapisz CSV z trade’ami dla pary
     out = f"{DATA_DIR}/trades_{pair.replace('/', '_')}.csv"
     os.makedirs(os.path.dirname(out) or ".", exist_ok=True)
     with open(out, "w", newline="") as f:
@@ -347,7 +355,6 @@ def run_backtest():
     total_round_trips = 0
 
     for pair in PAIRS:
-        # okno świec ~ (24 * days) dla 1h + zapas
         limit = min(1500, BACKTEST_DAYS * 24 + 250)
         df = get_candles(ex, pair, limit=limit)
         df = calculate_indicators(df).dropna().reset_index(drop=True)
@@ -365,10 +372,10 @@ def run_backtest():
     log.info(f"TOTAL: round_trips={total_round_trips} net_pnl={total_pnl:.4f}")
 
 # =========================
-# LIVE LOOP (paper)
+# PĘTLA GŁÓWNA (paper/live)
 # =========================
-def run_live():
-    log.info("🤖 Bot startuje — strategia: EMA200 + RSI pullback + MACD cross + SL/TP (paper)")
+def run_loop():
+    log.info(f"🤖 Bot startuje | MODE={MODE} | timeframe={TIMEFRAME}")
     ex = connect_binance()
     state = load_state(PAIRS)
 
@@ -379,22 +386,49 @@ def run_live():
             try:
                 df = calculate_indicators(get_candles(ex, pair, limit=250)).dropna()
                 signal, rsi, trend, price = get_signal(df)
-
                 pos = state[pair]
-                log.info(f"{pair} | Cena(close): {price:.2f} | RSI: {rsi:.1f} | Trend: {trend} | → {signal}")
 
-                # jeśli jesteśmy w pozycji -> pilnuj SL/TP
+                log.info(f"{pair} | close: {price:.2f} | RSI:{rsi:.1f} | Trend:{trend} | → {signal}")
+
                 if pos["in_pos"]:
                     if price <= float(pos["sl"]):
-                        paper_sell(state, pair, price, rsi, trend, reason="SL")
-                    elif price >= float(pos["tp"]):
-                        paper_sell(state, pair, price, rsi, trend, reason="TP")
-                    elif signal == "SELL":
-                        paper_sell(state, pair, price, rsi, trend, reason="SIGNAL")
+                        if MODE == "paper":
+                            paper_sell(state, pair, price, rsi, trend, reason="SL")
+                        else:
+                            live_sell(ex, pair)
+                            state[pair] = _default_pos()
+                            save_state(state)
 
-                # jeśli nie ma pozycji -> ewentualnie kup
-                elif signal == "BUY":
-                    paper_buy(state, pair, price, rsi, trend)
+                    elif price >= float(pos["tp"]):
+                        if MODE == "paper":
+                            paper_sell(state, pair, price, rsi, trend, reason="TP")
+                        else:
+                            live_sell(ex, pair)
+                            state[pair] = _default_pos()
+                            save_state(state)
+
+                    elif signal == "SELL":
+                        if MODE == "paper":
+                            paper_sell(state, pair, price, rsi, trend, reason="SIGNAL")
+                        else:
+                            live_sell(ex, pair)
+                            state[pair] = _default_pos()
+                            save_state(state)
+
+                else:
+                    if signal == "BUY":
+                        # wejście
+                        if MODE == "paper":
+                            paper_buy(state, pair, price, rsi, trend)
+                        else:
+                            live_buy(ex, pair, price, rsi, trend)
+                            # zapisujemy SL/TP do state nawet w live, żeby bot wiedział kiedy wyjść
+                            entry = price * (1 + SLIPPAGE)
+                            qty = TRADE_AMOUNT_USDT / entry
+                            sl = entry * (1 - SL_PCT)
+                            tp = entry * (1 + TP_PCT)
+                            state[pair] = {"in_pos": True, "entry": entry, "qty": qty, "sl": sl, "tp": tp}
+                            save_state(state)
 
             except Exception as e:
                 log.error(f"❌ {pair}: {e}")
@@ -408,5 +442,7 @@ def run_live():
 if __name__ == "__main__":
     if MODE == "backtest":
         run_backtest()
+    elif MODE in ("paper", "live"):
+        run_loop()
     else:
-        run_live()
+        raise RuntimeError("Ustaw MODE=paper albo MODE=live albo MODE=backtest")
