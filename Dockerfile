@@ -3,4 +3,4 @@ WORKDIR /app
 COPY Requirements.txt .
 RUN pip install -r Requirements.txt
 COPY . .
-CMD ["python", "-u", "trading_bot.py"]
+CMD ["python", "backtest.py"]
