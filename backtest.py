@@ -1,289 +1,417 @@
+# backtest.py
+# Backtest RSI + MACD (spot) dla wielu par, z kosztami (fee + slippage),
+# zapisuje szczegółowe transakcje do trades_<PAIR>.csv i drukuje statystyki per para + łączne.
+#
+# Wymagania: pip install ccxt pandas ta
+#
+# Uruchomienie lokalnie:
+#   python backtest.py
+#
+# Zmienne ENV (opcjonalne):
+#   PAIRS="BTC/USDT,ETH/USDT"
+#   TIMEFRAME="1h"
+#   DAYS="180"
+#   TRADE_USDT="50"
+#   RSI_PERIOD="14"
+#   RSI_BUY="45"
+#   RSI_SELL="55"
+#   MACD_FAST="12" MACD_SLOW="26" MACD_SIGNAL="9"
+#   FEE_RATE="0.001"
+#   SLIPPAGE_RATE="0.0002"
+
 import os
+import time
 import math
+import csv
 from datetime import datetime, timezone
-import pandas as pd
+
 import ccxt
+import pandas as pd
 import ta
 
-# =========================
-# USTAWIENIA BACKTESTU
-# =========================
-PAIRS = ["BTC/USDT", "ETH/USDT"]
-TIMEFRAME = "1h"
 
-# Okres w dniach do pobrania (1h -> ~24 świece/dzień)
-DAYS = int(os.getenv("BT_DAYS", "180"))  # np. 180 dni
-LIMIT_PER_CALL = 1000  # Binance zwykle 1000 świec na call
-
-TRADE_AMOUNT_USDT = float(os.getenv("TRADE_AMOUNT_USDT", "50"))
+# =========================
+# CONFIG (ENV -> default)
+# =========================
+PAIRS = [p.strip() for p in os.getenv("PAIRS", "BTC/USDT,ETH/USDT").split(",") if p.strip()]
+TIMEFRAME = os.getenv("TIMEFRAME", "1h")
+DAYS = int(os.getenv("DAYS", "180"))
+TRADE_USDT = float(os.getenv("TRADE_USDT", os.getenv("TRADE_AMOUNT_USDT", "50")))
 
 RSI_PERIOD = int(os.getenv("RSI_PERIOD", "14"))
-RSI_BUY = float(os.getenv("RSI_BUY", "45"))   # testowo lub docelowo 35
-RSI_SELL = float(os.getenv("RSI_SELL", "55")) # testowo lub docelowo 65
+RSI_BUY = float(os.getenv("RSI_BUY", "45"))
+RSI_SELL = float(os.getenv("RSI_SELL", "55"))
 
 MACD_FAST = int(os.getenv("MACD_FAST", "12"))
 MACD_SLOW = int(os.getenv("MACD_SLOW", "26"))
 MACD_SIGNAL = int(os.getenv("MACD_SIGNAL", "9"))
 
-FEE_RATE = float(os.getenv("FEE_RATE", "0.001"))         # 0.1%
-SLIPPAGE_RATE = float(os.getenv("SLIPPAGE_RATE", "0.0002"))  # 0.02%
+FEE_RATE = float(os.getenv("FEE_RATE", "0.001"))            # 0.1%
+SLIPPAGE_RATE = float(os.getenv("SLIPPAGE_RATE", "0.0002")) # 0.02%
+
+# bezpieczeństwo: na testy nie ustawiaj ogromnych wartości
+MAX_OHLCV_LIMIT = 1000
+
 
 # =========================
-# DANE
+# HELPERS
 # =========================
 def timeframe_to_ms(tf: str) -> int:
-    # prosty mapper dla popularnych TF
-    m = {"1m": 60, "3m": 180, "5m": 300, "15m": 900, "30m": 1800,
-         "1h": 3600, "2h": 7200, "4h": 14400, "6h": 21600, "12h": 43200,
-         "1d": 86400}
-    if tf not in m:
-        raise ValueError(f"Nieobsługiwany timeframe: {tf}")
-    return m[tf] * 1000
+    tf = tf.strip().lower()
+    if tf.endswith("m"):
+        return int(tf[:-1]) * 60_000
+    if tf.endswith("h"):
+        return int(tf[:-1]) * 3_600_000
+    if tf.endswith("d"):
+        return int(tf[:-1]) * 86_400_000
+    raise ValueError(f"Nieobsługiwany timeframe: {tf}")
 
-def fetch_ohlcv_full(exchange, symbol, timeframe, since_ms, until_ms):
-    all_rows = []
+
+def now_ms() -> int:
+    return int(datetime.now(timezone.utc).timestamp() * 1000)
+
+
+def iso_utc(ms: int) -> str:
+    return datetime.fromtimestamp(ms / 1000, tz=timezone.utc).isoformat()
+
+
+def pair_to_filename(pair: str) -> str:
+    return pair.replace("/", "_")
+
+
+# =========================
+# EXCHANGE (public data)
+# =========================
+def connect_exchange() -> ccxt.Exchange:
+    ex = ccxt.binance({
+        "enableRateLimit": True,
+        "options": {"defaultType": "spot"},
+    })
+    return ex
+
+
+def fetch_ohlcv_all(ex: ccxt.Exchange, symbol: str, timeframe: str, since_ms: int) -> pd.DataFrame:
+    """
+    Pobiera OHLCV od since_ms do teraz, paginując.
+    Binance limit 1000 na fetch; ccxt obsługuje to.
+    """
     tf_ms = timeframe_to_ms(timeframe)
+    data = []
     since = since_ms
 
-    while since < until_ms:
-        batch = exchange.fetch_ohlcv(symbol, timeframe=timeframe, since=since, limit=LIMIT_PER_CALL)
+    # zabezpieczenie przed pętlą
+    max_iters = 5000
+    it = 0
+
+    while True:
+        it += 1
+        if it > max_iters:
+            break
+
+        batch = ex.fetch_ohlcv(symbol, timeframe=timeframe, since=since, limit=MAX_OHLCV_LIMIT)
         if not batch:
             break
-        all_rows.extend(batch)
+
+        data.extend(batch)
+
         last_ts = batch[-1][0]
-        # zabezpieczenie przed zapętleniem
-        if last_ts == since:
-            break
+        # następne okno (unikamy duplikatów)
         since = last_ts + tf_ms
 
-        # jeśli już za daleko, kończ
-        if last_ts >= until_ms - tf_ms:
+        # jeśli jesteśmy blisko teraz, kończymy
+        if since >= now_ms() - tf_ms:
             break
 
-    df = pd.DataFrame(all_rows, columns=["timestamp","open","high","low","close","volume"])
-    df = df.drop_duplicates(subset=["timestamp"]).sort_values("timestamp").reset_index(drop=True)
+        # rate limit
+        time.sleep(ex.rateLimit / 1000)
+
+    if not data:
+        return pd.DataFrame(columns=["ts", "open", "high", "low", "close", "volume"])
+
+    df = pd.DataFrame(data, columns=["ts", "open", "high", "low", "close", "volume"])
+    df = df.drop_duplicates(subset=["ts"]).sort_values("ts").reset_index(drop=True)
     return df
+
 
 def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
+
     df["rsi"] = ta.momentum.RSIIndicator(df["close"], window=RSI_PERIOD).rsi()
 
     macd = ta.trend.MACD(
         df["close"],
         window_fast=MACD_FAST,
         window_slow=MACD_SLOW,
-        window_sign=MACD_SIGNAL
+        window_sign=MACD_SIGNAL,
     )
     df["macd"] = macd.macd()
     df["macd_signal"] = macd.macd_signal()
+
     return df
 
-def signal_at_row(df: pd.DataFrame, i: int) -> str:
-    # sygnał liczony na zamknięciu świecy i (używa i-1 i i)
-    if i < 2:
-        return "HOLD"
-    last = df.iloc[i]
-    prev = df.iloc[i-1]
-
-    rsi = last["rsi"]
-    cross_up = prev["macd"] < prev["macd_signal"] and last["macd"] > last["macd_signal"]
-    cross_down = prev["macd"] > prev["macd_signal"] and last["macd"] < last["macd_signal"]
-
-    if pd.isna(rsi) or pd.isna(prev["macd"]) or pd.isna(prev["macd_signal"]) or pd.isna(last["macd"]) or pd.isna(last["macd_signal"]):
-        return "HOLD"
-
-    if rsi < RSI_BUY and cross_up:
-        return "BUY"
-    if rsi > RSI_SELL and cross_down:
-        return "SELL"
-    return "HOLD"
-
 
 # =========================
-# BACKTEST
+# STRATEGY + BACKTEST
 # =========================
-def backtest_symbol(df: pd.DataFrame, symbol: str) -> dict:
+def macd_cross_up(prev_macd, prev_sig, macd_val, sig_val) -> bool:
+    return (prev_macd < prev_sig) and (macd_val > sig_val)
+
+
+def macd_cross_down(prev_macd, prev_sig, macd_val, sig_val) -> bool:
+    return (prev_macd > prev_sig) and (macd_val < sig_val)
+
+
+def backtest_pair(df: pd.DataFrame, pair: str) -> dict:
     """
-    Założenia:
-    - 1 pozycja max (long only), BUY otwiera, SELL zamyka
-    - transakcja wykonana na OPEN następnej świecy po sygnale
-    - kwota stała w USDT na wejście
-    - fee liczone na wejściu i wyjściu
-    - slippage jako % ceny
+    Long-only: BUY gdy RSI < RSI_BUY i MACD cross up
+              SELL gdy RSI > RSI_SELL i MACD cross down
+    Wejście/wyjście na close świecy, z poślizgiem i prowizją.
+    Stała wielkość pozycji: TRADE_USDT / entry_price.
     """
+    if df.empty or len(df) < 5:
+        return {
+            "pair": pair,
+            "round_trips": 0,
+            "wins": 0,
+            "losses": 0,
+            "net_pnl": 0.0,
+            "gross_profit": 0.0,
+            "gross_loss": 0.0,
+            "profit_factor": 0.0,
+            "expectancy": 0.0,
+            "maxDD": 0.0,
+            "trades": [],
+        }
+
+    df = add_indicators(df)
+    df = df.dropna().reset_index(drop=True)
+    if len(df) < 5:
+        return {
+            "pair": pair,
+            "round_trips": 0,
+            "wins": 0,
+            "losses": 0,
+            "net_pnl": 0.0,
+            "gross_profit": 0.0,
+            "gross_loss": 0.0,
+            "profit_factor": 0.0,
+            "expectancy": 0.0,
+            "maxDD": 0.0,
+            "trades": [],
+        }
+
     in_pos = False
     entry_price = None
     qty = 0.0
+    entry_fees = 0.0
+    entry_ts = None
 
     trades = []
-    equity = [0.0]  # krzywa PnL skumulowanego
-    cum_pnl = 0.0
+    equity = 0.0
+    peak = 0.0
+    max_dd = 0.0
 
-    # iterujemy po świecach i generujemy sygnał na close świecy i,
-    # a wykonujemy na open świecy i+1 -> dlatego stop na len-2
-    for i in range(2, len(df)-1):
-        sig = signal_at_row(df, i)
-        next_open = float(df.iloc[i+1]["open"])
-        ts = int(df.iloc[i+1]["timestamp"])
+    gross_profit = 0.0
+    gross_loss = 0.0
+    wins = 0
+    losses = 0
+    net_pnl = 0.0
+    round_trips = 0
 
-        if sig == "BUY" and not in_pos:
-            fill = next_open * (1 + SLIPPAGE_RATE)
-            qty = TRADE_AMOUNT_USDT / fill
-            fee_in = (fill * qty) * FEE_RATE
+    for i in range(1, len(df)):
+        prev = df.iloc[i - 1]
+        cur = df.iloc[i]
 
-            in_pos = True
-            entry_price = fill
+        price = float(cur["close"])
+        rsi = float(cur["rsi"])
+        prev_macd = float(prev["macd"])
+        prev_sig = float(prev["macd_signal"])
+        macd_val = float(cur["macd"])
+        sig_val = float(cur["macd_signal"])
+
+        buy_sig = (rsi < RSI_BUY) and macd_cross_up(prev_macd, prev_sig, macd_val, sig_val)
+        sell_sig = (rsi > RSI_SELL) and macd_cross_down(prev_macd, prev_sig, macd_val, sig_val)
+
+        ts = int(cur["ts"])
+
+        # ENTRY
+        if (not in_pos) and buy_sig:
+            # kupujemy gorzej (slippage w górę)
+            entry_price = price * (1.0 + SLIPPAGE_RATE)
+            qty = TRADE_USDT / entry_price
+            # fee od wartości transakcji
+            entry_value = entry_price * qty
+            entry_fees = entry_value * FEE_RATE
+            entry_ts = ts
 
             trades.append({
-                "ts": ts,
-                "symbol": symbol,
+                "ts": iso_utc(ts),
+                "pair": pair,
                 "side": "BUY",
-                "price": fill,
+                "price": entry_price,
                 "qty": qty,
-                "fee": fee_in,
-                "pnl": 0.0
+                "rsi": rsi,
+                "macd": macd_val,
+                "macd_signal": sig_val,
+                "fee": entry_fees,
+                "pnl": "",
+                "equity": equity,
+                "note": "RSI+MACD",
             })
+            in_pos = True
+            continue
 
-        elif sig == "SELL" and in_pos:
-            fill = next_open * (1 - SLIPPAGE_RATE)
-            fee_out = (fill * qty) * FEE_RATE
+        # EXIT
+        if in_pos and sell_sig:
+            # sprzedajemy gorzej (slippage w dół)
+            exit_price = price * (1.0 - SLIPPAGE_RATE)
+            exit_value = exit_price * qty
+            exit_fee = exit_value * FEE_RATE
 
-            gross = (fill - entry_price) * qty
-            pnl = gross - (fee_out + (entry_price * qty * FEE_RATE))  # fee in + fee out
+            gross = (exit_price - entry_price) * qty
+            fees = entry_fees + exit_fee
+            pnl = gross - fees
 
-            cum_pnl += pnl
-            equity.append(cum_pnl)
+            net_pnl += pnl
+            equity += pnl
+
+            # drawdown
+            peak = max(peak, equity)
+            dd = equity - peak
+            max_dd = min(max_dd, dd)
+
+            if pnl >= 0:
+                wins += 1
+                gross_profit += pnl
+            else:
+                losses += 1
+                gross_loss += pnl  # ujemne
+
+            round_trips += 1
 
             trades.append({
-                "ts": ts,
-                "symbol": symbol,
+                "ts": iso_utc(ts),
+                "pair": pair,
                 "side": "SELL",
-                "price": fill,
+                "price": exit_price,
                 "qty": qty,
-                "fee": fee_out,
-                "pnl": pnl
+                "rsi": rsi,
+                "macd": macd_val,
+                "macd_signal": sig_val,
+                "fee": exit_fee,
+                "pnl": pnl,
+                "equity": equity,
+                "note": f"EXIT | entry={iso_utc(entry_ts)}",
             })
 
+            # reset
             in_pos = False
             entry_price = None
             qty = 0.0
+            entry_fees = 0.0
+            entry_ts = None
 
-    trades_df = pd.DataFrame(trades)
-    if trades_df.empty:
-        return {
-            "symbol": symbol,
-            "trades": 0,
-            "round_trips": 0,
-            "net_pnl": 0.0,
-            "win_rate": None,
-            "profit_factor": None,
-            "expectancy": None,
-            "max_drawdown": None,
-            "trades_df": trades_df
-        }
-
-    # round-trips = liczba SELL
-    sells = trades_df[trades_df["side"] == "SELL"].copy()
-    round_trips = len(sells)
-
-    net_pnl = float(sells["pnl"].sum())
-    wins = sells[sells["pnl"] > 0]
-    losses = sells[sells["pnl"] < 0]
-
-    win_rate = (len(wins) / round_trips) if round_trips else None
-    gross_profit = float(wins["pnl"].sum())
-    gross_loss = float(losses["pnl"].sum())  # ujemne
-    profit_factor = (gross_profit / abs(gross_loss)) if gross_loss != 0 else (math.inf if gross_profit > 0 else None)
-
-    avg_win = float(wins["pnl"].mean()) if len(wins) else 0.0
-    avg_loss = float(losses["pnl"].mean()) if len(losses) else 0.0  # ujemne
-    expectancy = (win_rate * avg_win + (1 - win_rate) * avg_loss) if win_rate is not None else None
-
-    # max drawdown na krzywej equity
-    eq = pd.Series(equity)
-    roll_max = eq.cummax()
-    dd = eq - roll_max
-    max_dd = float(dd.min())  # ujemne
-
-    # dodaj czytelny czas
-    def ts_to_str(x):
-        return datetime.fromtimestamp(int(x)/1000, tz=timezone.utc).isoformat()
-
-    trades_df["time_utc"] = trades_df["ts"].apply(ts_to_str)
+    total_trades = wins + losses
+    profit_factor = abs(gross_profit / gross_loss) if gross_loss != 0 else 0.0
+    expectancy = net_pnl / total_trades if total_trades > 0 else 0.0
 
     return {
-        "symbol": symbol,
-        "trades": len(trades_df),
+        "pair": pair,
         "round_trips": round_trips,
-        "net_pnl": net_pnl,
-        "win_rate": win_rate,
-        "profit_factor": profit_factor,
-        "expectancy": expectancy,
-        "max_drawdown": max_dd,
-        "trades_df": trades_df
+        "wins": wins,
+        "losses": losses,
+        "net_pnl": float(net_pnl),
+        "gross_profit": float(gross_profit),
+        "gross_loss": float(gross_loss),  # ujemne
+        "profit_factor": float(profit_factor),
+        "expectancy": float(expectancy),
+        "maxDD": float(max_dd),
+        "trades": trades,
     }
 
+
+def save_trades_csv(pair: str, trades: list) -> str:
+    filename = f"trades_{pair_to_filename(pair)}.csv"
+    if not trades:
+        # zapis pustego nagłówka też jest ok
+        fields = ["ts", "pair", "side", "price", "qty", "rsi", "macd", "macd_signal", "fee", "pnl", "equity", "note"]
+        with open(filename, "w", newline="") as f:
+            w = csv.DictWriter(f, fieldnames=fields)
+            w.writeheader()
+        return filename
+
+    fields = list(trades[0].keys())
+    with open(filename, "w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=fields)
+        w.writeheader()
+        for row in trades:
+            w.writerow(row)
+    return filename
+
+
+# =========================
+# MAIN
+# =========================
 def main():
-    exchange = ccxt.binance({"enableRateLimit": True})
-    exchange.load_markets()
-
-    now_ms = exchange.milliseconds()
-    since_ms = now_ms - DAYS * 24 * 60 * 60 * 1000
-
-    print(f"\nBACKTEST: timeframe={TIMEFRAME} days={DAYS}")
+    print(f"BACKTEST: timeframe={TIMEFRAME} days={DAYS}")
     print(f"Params: RSI({RSI_PERIOD}) BUY<{RSI_BUY} SELL>{RSI_SELL} | MACD {MACD_FAST}/{MACD_SLOW}/{MACD_SIGNAL}")
-    print(f"Costs: fee={FEE_RATE} slippage={SLIPPAGE_RATE} | trade_usdt={TRADE_AMOUNT_USDT}\n")
+    print(f"Costs: fee={FEE_RATE} slippage={SLIPPAGE_RATE} | trade_usdt={TRADE_USDT}\n")
+
+    ex = connect_exchange()
+
+    tf_ms = timeframe_to_ms(TIMEFRAME)
+    since_ms = now_ms() - DAYS * 86_400_000
 
     results = []
-    for sym in PAIRS:
-        df = fetch_ohlcv_full(exchange, sym, TIMEFRAME, since_ms, now_ms)
-        if df.empty or len(df) < 100:
-            print(f"{sym}: za mało danych ({len(df)})")
-            continue
-        df = add_indicators(df)
-        res = backtest_symbol(df, sym)
-        results.append(res)
 
-        print(f"{sym}: round_trips={res['round_trips']} net_pnl={res['net_pnl']:.4f} "
-              f"win_rate={None if res['win_rate'] is None else round(res['win_rate']*100,2)}% "
-              f"PF={res['profit_factor']} "
-              f"exp={res['expectancy']} "
-              f"maxDD={res['max_drawdown']:.4f}")
+    for pair in PAIRS:
+        try:
+            df = fetch_ohlcv_all(ex, pair, TIMEFRAME, since_ms)
+            res = backtest_pair(df, pair)
 
-        # zapis transakcji do CSV (osobno dla symbolu)
-        out_csv = f"trades_{sym.replace('/','_')}.csv"
-        res["trades_df"].to_csv(out_csv, index=False)
-        print(f"  -> zapisano {out_csv}")
+            # zapis transakcji
+            out = save_trades_csv(pair, res["trades"])
+            print(f"{pair}: round_trips={res['round_trips']} net_pnl={res['net_pnl']:.4f} "
+                  f"win_rate={(res['wins']/(res['wins']+res['losses'])*100) if (res['wins']+res['losses'])>0 else 0:.2f}% "
+                  f"PF={res['profit_factor']:.3f} exp={res['expectancy']:.4f} maxDD={res['maxDD']:.4f}")
+            print(f"-> zapisano {out}\n")
 
-# =========================
-# PODSUMOWANIE ŁĄCZNE
-# =========================
-if results:
-    total_pnl = sum(r["net_pnl"] for r in results)
-    total_round_trips = sum(r["round_trips"] for r in results)
-    total_wins = sum(r["wins"] for r in results)
-    total_losses = sum(r["losses"] for r in results)
-    total_trades = total_wins + total_losses
+            results.append(res)
+        except Exception as e:
+            print(f"❌ {pair}: {e}\n")
 
-    win_rate = (total_wins / total_trades * 100) if total_trades > 0 else 0
+    # =========================
+    # PODSUMOWANIE ŁĄCZNE
+    # =========================
+    if results:
+        total_pnl = sum(r.get("net_pnl", 0) for r in results)
+        total_round_trips = sum(r.get("round_trips", 0) for r in results)
 
-    # profit factor liczony globalnie
-    gross_profit = sum(r["gross_profit"] for r in results)
-    gross_loss = sum(r["gross_loss"] for r in results)
-    profit_factor = abs(gross_profit / gross_loss) if gross_loss != 0 else 0
+        total_wins = sum(r.get("wins", 0) for r in results)
+        total_losses = sum(r.get("losses", 0) for r in results)
+        total_trades = total_wins + total_losses
 
-    expectancy = total_pnl / total_trades if total_trades > 0 else 0
+        win_rate = (total_wins / total_trades * 100) if total_trades > 0 else 0
 
-    print("\n==============================")
-    print("BACKTEST SUMMARY")
-    print("==============================")
-    print(f"Round trips: {total_round_trips}")
-    print(f"Trades:      {total_trades}")
-    print(f"Win rate:    {win_rate:.2f}%")
-    print(f"Net PnL:     {total_pnl:.4f} USDT")
-    print(f"ProfitFact:  {profit_factor:.3f}")
-    print(f"Expectancy:  {expectancy:.4f} USDT/trade")
-    print("==============================\n")
+        gross_profit = sum(r.get("gross_profit", 0) for r in results)
+        gross_loss = sum(r.get("gross_loss", 0) for r in results)  # ujemne
+        profit_factor = abs(gross_profit / gross_loss) if gross_loss != 0 else 0
+
+        expectancy = total_pnl / total_trades if total_trades > 0 else 0
+
+        print("\n==============================")
+        print("BACKTEST SUMMARY")
+        print("==============================")
+        print(f"Round trips: {total_round_trips}")
+        print(f"Trades:      {total_trades}")
+        print(f"Win rate:    {win_rate:.2f}%")
+        print(f"Net PnL:     {total_pnl:.4f} USDT")
+        print(f"ProfitFact:  {profit_factor:.3f}")
+        print(f"Expectancy:  {expectancy:.4f} USDT/trade")
+        print("==============================\n")
+    else:
+        print("Brak wyników (results puste).")
+
 
 if __name__ == "__main__":
     main()
