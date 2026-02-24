@@ -255,11 +255,35 @@ def main():
         res["trades_df"].to_csv(out_csv, index=False)
         print(f"  -> zapisano {out_csv}")
 
-    # podsumowanie łączne
-    if results:
-        total_pnl = sum(r["net_pnl"] for r in results)
-        total_round_trips = sum(r["round_trips"] for r in results)
-        print(f"\nTOTAL: round_trips={total_round_trips} net_pnl={total_pnl:.4f}\n")
+# =========================
+# PODSUMOWANIE ŁĄCZNE
+# =========================
+if results:
+    total_pnl = sum(r["net_pnl"] for r in results)
+    total_round_trips = sum(r["round_trips"] for r in results)
+    total_wins = sum(r["wins"] for r in results)
+    total_losses = sum(r["losses"] for r in results)
+    total_trades = total_wins + total_losses
+
+    win_rate = (total_wins / total_trades * 100) if total_trades > 0 else 0
+
+    # profit factor liczony globalnie
+    gross_profit = sum(r["gross_profit"] for r in results)
+    gross_loss = sum(r["gross_loss"] for r in results)
+    profit_factor = abs(gross_profit / gross_loss) if gross_loss != 0 else 0
+
+    expectancy = total_pnl / total_trades if total_trades > 0 else 0
+
+    print("\n==============================")
+    print("BACKTEST SUMMARY")
+    print("==============================")
+    print(f"Round trips: {total_round_trips}")
+    print(f"Trades:      {total_trades}")
+    print(f"Win rate:    {win_rate:.2f}%")
+    print(f"Net PnL:     {total_pnl:.4f} USDT")
+    print(f"ProfitFact:  {profit_factor:.3f}")
+    print(f"Expectancy:  {expectancy:.4f} USDT/trade")
+    print("==============================\n")
 
 if __name__ == "__main__":
     main()
