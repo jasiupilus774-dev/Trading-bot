@@ -1,86 +1,105 @@
 import os
-import math
 import csv
-from datetime import datetime, timedelta, timezone
-
-import ccxt
+import math
 import pandas as pd
 import ta
-
+import ccxt
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 
 # =========================
-# KONFIGURACJA (A)
+# CONFIGURATION (SPOT LONG-only)
 # =========================
 PAIRS = ["BTC/USDT", "ETH/USDT"]
 
-TIMEFRAME = os.getenv("TIMEFRAME", "15m")
+TIMEFRAME = os.getenv("TIMEFRAME", "1h")   # "15m" albo "1h"
 DAYS = int(os.getenv("DAYS", "180"))
 
-TRADE_USDT = float(os.getenv("TRADE_USDT", "50"))
+INITIAL_CASH = float(os.getenv("INITIAL_CASH", "1000.0"))
+RISK_PER_TRADE = float(os.getenv("RISK_PER_TRADE", "0.01"))  # 1% ryzyka na trade
+
 FEE_RATE = float(os.getenv("FEE_RATE", "0.001"))          # 0.1%
 SLIPPAGE = float(os.getenv("SLIPPAGE_RATE", "0.0002"))    # 0.02%
 
-# Trend
+# Strategia: EMA200 + Donchian + RSI + ATR SL + trailing
 EMA_LEN = int(os.getenv("EMA_LEN", "200"))
-
-# Breakout (Donchian)
-BREAKOUT_LEN = int(os.getenv("BREAKOUT_LEN", "10"))
-
-# ATR SL/TP
+DONCH_LEN = int(os.getenv("DONCH_LEN", "20"))
 ATR_LEN = int(os.getenv("ATR_LEN", "14"))
-SL_ATR = float(os.getenv("SL_ATR", "1.0"))    # SL = 1.0 * ATR
-TP_ATR = float(os.getenv("TP_ATR", "1.5"))    # TP = 1.5 * ATR
+SL_ATR_MULT = float(os.getenv("SL_ATR_MULT", "1.5"))
 
-# CSV output
-OUT_DIR = os.getenv("OUT_DIR", ".")  # na Railway zostaw "."
-os.makedirs(OUT_DIR, exist_ok=True)
+# Filtry RSI (LONG)
+RSI_LEN = int(os.getenv("RSI_LEN", "14"))
+RSI_LONG_MIN = float(os.getenv("RSI_LONG_MIN", "40"))
+RSI_LONG_MAX = float(os.getenv("RSI_LONG_MAX", "55"))
+
+# CSV output (opcjonalnie)
+TRADES_CSV = os.getenv("TRADES_CSV", "backtest_trades.csv")
+
+
+@dataclass
+class Trade:
+    ts_entry: str
+    ts_exit: str
+    pair: str
+    side: str
+    entry: float
+    exit: float
+    qty: float
+    pnl: float
+    reason: str
 
 
 # =========================
-# BINANCE (SPOT TESTNET do świec / dane)
+# UTILS
 # =========================
-def connect_binance():
-    api_key = os.getenv("BINANCE_API_KEY")
-    api_secret = os.getenv("BINANCE_API_SECRET")
-    if not api_key or not api_secret:
-        raise RuntimeError("Brak BINANCE_API_KEY / BINANCE_API_SECRET w Variables")
-
-    ex = ccxt.binance({
-        "apiKey": api_key,
-        "secret": api_secret,
-        "enableRateLimit": True,
-        "options": {"defaultType": "spot"},
-    })
-    # Testnet (dla spójności z tym co już masz na Railway)
-    ex.set_sandbox_mode(True)
-    return ex
+def tf_to_ms(tf: str) -> int:
+    unit = tf[-1]
+    n = int(tf[:-1])
+    if unit == "m":
+        return n * 60_000
+    if unit == "h":
+        return n * 60 * 60_000
+    if unit == "d":
+        return n * 24 * 60 * 60_000
+    raise ValueError(f"Unknown timeframe: {tf}")
 
 
-def fetch_ohlcv(ex, pair, timeframe, since_ms):
+def ensure_dir_for_file(path: str):
+    d = os.path.dirname(path)
+    if d:
+        os.makedirs(d, exist_ok=True)
+
+
+def connect_binance_public():
+    return ccxt.binance({"enableRateLimit": True, "options": {"defaultType": "spot"}})
+
+
+def fetch_ohlcv_history(ex, pair: str, timeframe: str, since_ms: int) -> pd.DataFrame:
     """
-    Pobiera OHLCV od since_ms do teraz.
+    Pobiera OHLCV od since_ms do teraz, z paginacją (ważne).
     """
     all_rows = []
     limit = 1000
     now_ms = ex.milliseconds()
+    tf_ms = tf_to_ms(timeframe)
 
+    cur = since_ms
     while True:
-        rows = ex.fetch_ohlcv(pair, timeframe=timeframe, since=since_ms, limit=limit)
-        if not rows:
-            break
-        all_rows.extend(rows)
-
-        last_ts = rows[-1][0]
-        # zabezpieczenie przed pętlą
-        if last_ts == since_ms:
+        batch = ex.fetch_ohlcv(pair, timeframe=timeframe, since=cur, limit=limit)
+        if not batch:
             break
 
-        since_ms = last_ts + 1
-        if since_ms >= now_ms:
+        all_rows.extend(batch)
+        last_ts = batch[-1][0]
+
+        # przesuwamy o jedną świecę do przodu
+        cur = last_ts + tf_ms
+
+        if cur >= now_ms:
             break
 
-        # jak przyszło mniej niż limit, to koniec
-        if len(rows) < limit:
+        # jeśli dostaliśmy mniej niż limit, kończymy
+        if len(batch) < limit:
             break
 
     df = pd.DataFrame(all_rows, columns=["ts", "open", "high", "low", "close", "volume"])
@@ -89,308 +108,188 @@ def fetch_ohlcv(ex, pair, timeframe, since_ms):
     return df
 
 
+# =========================
+# INDICATORS
+# =========================
 def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
-    # EMA200 trend
-    df["ema"] = ta.trend.EMAIndicator(df["close"], window=EMA_LEN).ema_indicator()
+    df = df.copy()
+    df["ema200"] = ta.trend.EMAIndicator(df["close"], window=EMA_LEN).ema_indicator()
 
-    # ATR
+    # Donchian liczymy i przesuwamy o 1 świecę, żeby nie używać bieżącej
+    df["donch_high"] = df["high"].rolling(DONCH_LEN).max().shift(1)
+    df["donch_low"] = df["low"].rolling(DONCH_LEN).min().shift(1)
+
     df["atr"] = ta.volatility.AverageTrueRange(
-        high=df["high"], low=df["low"], close=df["close"], window=ATR_LEN
+        df["high"], df["low"], df["close"], window=ATR_LEN
     ).average_true_range()
 
-    # Donchian channel (rolling high/low)
-    df["donch_hi"] = df["high"].rolling(BREAKOUT_LEN).max()
-    df["donch_lo"] = df["low"].rolling(BREAKOUT_LEN).min()
-
+    df["rsi"] = ta.momentum.RSIIndicator(df["close"], window=RSI_LEN).rsi()
     return df
 
 
-def costs_for_trade(entry_price, exit_price, qty):
-    """
-    koszty: fee od nominału wejścia + wyjścia
-    """
-    notional_in = entry_price * qty
-    notional_out = exit_price * qty
-    fees = (notional_in + notional_out) * FEE_RATE
-    return fees
-
-
-def backtest_pair(df: pd.DataFrame, pair: str):
-    """
-    Strategia A: trend + breakout + ATR SL/TP.
-    LONG gdy close > EMA i wybicie donch_hi
-    SHORT gdy close < EMA i wybicie donch_lo
-    """
-    # Upewnij się, że mamy dane do wskaźników
-    df = df.copy()
-    df = add_indicators(df)
-
-    # start dopiero gdy wszystko policzone
-    warmup = max(EMA_LEN, ATR_LEN, BREAKOUT_LEN) + 2
-    if len(df) <= warmup:
-        raise RuntimeError(f"Za mało świec dla {pair}. Potrzebuję > {warmup}")
+# =========================
+# BACKTEST ENGINE (LONG-only)
+# =========================
+def run_backtest(df: pd.DataFrame, pair: str):
+    cash = INITIAL_CASH
+    peak_cash = INITIAL_CASH
+    max_drawdown = 0.0
 
     in_pos = False
-    side = None  # "LONG" / "SHORT"
     entry = None
-    sl = None
-    tp = None
     qty = 0.0
+    sl = None
+    entry_ts = None
 
-    equity = 0.0
-    peak_equity = 0.0
-    max_dd = 0.0
+    trades: list[Trade] = []
 
-    trades = []
-    wins = 0
-    losses = 0
-    gross_profit = 0.0
-    gross_loss = 0.0
+    # Warmup
+    warmup = max(EMA_LEN, DONCH_LEN, ATR_LEN, RSI_LEN) + 5
+    if len(df) <= warmup:
+        return trades, cash, max_drawdown
 
-    for i in range(warmup, len(df)):
-        row = df.iloc[i]
-        prev = df.iloc[i - 1]
+    for i in range(warmup + 1, len(df)):
+        prev = df.iloc[i - 1]  # sygnał na zamknięciu prev
+        cur = df.iloc[i]       # wejście/wyjście na open cur (model)
 
-        close = float(row["close"])
-        ema = float(row["ema"])
-        atr = float(row["atr"])
-        donch_hi_prev = float(prev["donch_hi"])
-        donch_lo_prev = float(prev["donch_lo"])
+        # --- EXIT (jeśli w pozycji)
+        if in_pos:
+            exit_price = None
+            reason = None
 
-        # sygnały wejścia (breakout na zamknięciu świecy)
-        long_signal = (close > ema) and (close > donch_hi_prev)
-        short_signal = (close < ema) and (close < donch_lo_prev)
+            # SL intrabar: jeśli low <= sl, wyjście po sl (z poślizgiem)
+            if cur["low"] <= sl:
+                exit_raw = float(sl)
+                exit_price = exit_raw * (1 - SLIPPAGE)
+                reason = "SL"
+            else:
+                # trailing SL: podciągamy SL do prev.donch_low (konserwatywnie)
+                if not pd.isna(prev["donch_low"]):
+                    sl = max(sl, float(prev["donch_low"]))
 
-        # jeśli nie w pozycji — otwieramy
+            if reason:
+                gross = (exit_price - entry) * qty
+                fees = (entry * qty + exit_price * qty) * FEE_RATE
+                pnl = gross - fees
+
+                cash += pnl
+                peak_cash = max(peak_cash, cash)
+                dd = (peak_cash - cash) / peak_cash if peak_cash > 0 else 0.0
+                max_drawdown = max(max_drawdown, dd)
+
+                trades.append(
+                    Trade(
+                        ts_entry=entry_ts.isoformat(),
+                        ts_exit=cur["ts"].isoformat(),
+                        pair=pair,
+                        side="LONG",
+                        entry=float(entry),
+                        exit=float(exit_price),
+                        qty=float(qty),
+                        pnl=float(pnl),
+                        reason=reason,
+                    )
+                )
+
+                in_pos = False
+                entry = None
+                qty = 0.0
+                sl = None
+                entry_ts = None
+
+        # --- ENTRY (tylko jeśli flat)
         if not in_pos:
-            if long_signal and atr > 0:
-                side = "LONG"
-                entry = close * (1 + SLIPPAGE)
-                qty = TRADE_USDT / entry
-                sl = entry - SL_ATR * atr
-                tp = entry + TP_ATR * atr
+            if pd.isna(prev["ema200"]) or pd.isna(prev["donch_high"]) or pd.isna(prev["atr"]) or pd.isna(prev["rsi"]):
+                continue
 
+            # Trend + RSI pullback + breakout
+            is_long = (
+                prev["close"] > prev["ema200"]
+                and RSI_LONG_MIN <= prev["rsi"] <= RSI_LONG_MAX
+                and prev["close"] >= prev["donch_high"]
+            )
+
+            if is_long:
+                entry_raw = float(cur["open"])
+                entry = entry_raw * (1 + SLIPPAGE)
+
+                sl_dist = float(prev["atr"]) * SL_ATR_MULT
+                if sl_dist <= 0:
+                    continue
+
+                # risk-based sizing (bez lewara): ryzyko 1% kapitału
+                risk_usdt = cash * RISK_PER_TRADE
+                qty = risk_usdt / sl_dist
+
+                # ograniczenie do posiadanego cash
+                max_qty = cash / entry
+                qty = min(qty, max_qty)
+
+                # zabezpieczenie: jeśli qty jest praktycznie 0
+                if qty <= 0:
+                    continue
+
+                sl = entry - sl_dist
+                entry_ts = cur["ts"]
                 in_pos = True
-                trades.append({
-                    "ts_entry": row["ts"].isoformat(),
-                    "pair": pair,
-                    "side": side,
-                    "entry": entry,
-                    "qty": qty,
-                    "sl": sl,
-                    "tp": tp,
-                    "ts_exit": None,
-                    "exit": None,
-                    "reason": None,
-                    "gross": None,
-                    "fees": None,
-                    "pnl": None,
-                    "equity": None,
-                })
 
-            elif short_signal and atr > 0:
-                side = "SHORT"
-                entry = close * (1 - SLIPPAGE)  # short entry (konserwatywnie)
-                qty = TRADE_USDT / entry
-                sl = entry + SL_ATR * atr
-                tp = entry - TP_ATR * atr
-
-                in_pos = True
-                trades.append({
-                    "ts_entry": row["ts"].isoformat(),
-                    "pair": pair,
-                    "side": side,
-                    "entry": entry,
-                    "qty": qty,
-                    "sl": sl,
-                    "tp": tp,
-                    "ts_exit": None,
-                    "exit": None,
-                    "reason": None,
-                    "gross": None,
-                    "fees": None,
-                    "pnl": None,
-                    "equity": None,
-                })
-
-            continue
-
-        # jeśli w pozycji — sprawdzamy SL/TP
-        assert trades, "Brak trade, a in_pos=True"
-        t = trades[-1]
-
-        exit_price = None
-        reason = None
-
-        # Zakładamy wykonanie na close (prosto, konserwatywnie + slippage)
-        if side == "LONG":
-            # SL/TP
-            if close <= sl:
-                exit_price = close * (1 - SLIPPAGE)
-                reason = "SL"
-            elif close >= tp:
-                exit_price = close * (1 - SLIPPAGE)
-                reason = "TP"
-
-        elif side == "SHORT":
-            if close >= sl:
-                exit_price = close * (1 + SLIPPAGE)
-                reason = "SL"
-            elif close <= tp:
-                exit_price = close * (1 + SLIPPAGE)
-                reason = "TP"
-
-        if exit_price is None:
-            continue
-
-        # rozliczenie
-        if side == "LONG":
-            gross = (exit_price - entry) * qty
-        else:
-            gross = (entry - exit_price) * qty
-
-        fees = costs_for_trade(entry, exit_price, qty)
-        pnl = gross - fees
-
-        equity += pnl
-        peak_equity = max(peak_equity, equity)
-        dd = equity - peak_equity  # <= 0
-        max_dd = min(max_dd, dd)
-
-        if pnl >= 0:
-            wins += 1
-            gross_profit += pnl
-        else:
-            losses += 1
-            gross_loss += pnl  # ujemne
-
-        # zapis trade
-        t["ts_exit"] = row["ts"].isoformat()
-        t["exit"] = exit_price
-        t["reason"] = reason
-        t["gross"] = gross
-        t["fees"] = fees
-        t["pnl"] = pnl
-        t["equity"] = equity
-
-        # reset pozycji
-        in_pos = False
-        side = None
-        entry = sl = tp = None
-        qty = 0.0
-
-    # metryki
-    round_trips = wins + losses
-    net_pnl = equity
-    win_rate = (wins / round_trips * 100.0) if round_trips else 0.0
-
-    # Profit Factor: suma zysków / suma strat (wartość dodatnia)
-    pf = (gross_profit / abs(gross_loss)) if gross_loss != 0 else 0.0
-    expectancy = (net_pnl / round_trips) if round_trips else 0.0
-
-    return {
-        "pair": pair,
-        "round_trips": round_trips,
-        "wins": wins,
-        "losses": losses,
-        "win_rate": win_rate,
-        "net_pnl": net_pnl,
-        "profit_factor": pf,
-        "expectancy": expectancy,
-        "max_dd": max_dd,
-        "gross_profit": gross_profit,
-        "gross_loss": gross_loss,
-        "trades": trades,
-    }
+    return trades, cash, max_drawdown
 
 
-def write_trades_csv(pair: str, trades: list):
-    safe_pair = pair.replace("/", "_")
-    path = os.path.join(OUT_DIR, f"trades_{safe_pair}.csv")
-    fields = [
-        "ts_entry", "ts_exit", "pair", "side", "entry", "exit", "qty",
-        "sl", "tp", "reason", "gross", "fees", "pnl", "equity"
-    ]
+def write_trades(trades: list[Trade], path: str):
+    ensure_dir_for_file(path)
     with open(path, "w", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=fields)
-        w.writeheader()
+        w = csv.writer(f)
+        w.writerow(["ts_entry", "ts_exit", "pair", "side", "entry", "exit", "qty", "pnl", "reason"])
         for t in trades:
-            row = {k: t.get(k) for k in fields}
-            w.writerow(row)
-    print(f"-> zapisano {os.path.basename(path)}")
+            w.writerow([t.ts_entry, t.ts_exit, t.pair, t.side, t.entry, t.exit, t.qty, t.pnl, t.reason])
 
 
-def main():
-    ex = connect_binance()
+# =========================
+# RUN + REPORT
+# =========================
+if __name__ == "__main__":
+    print(f"--- START BACKTESTU (SPOT LONG-only) | {DAYS} dni | TF: {TIMEFRAME} ---")
+    print(f"Params: EMA={EMA_LEN} Donch={DONCH_LEN} ATR={ATR_LEN} SL_ATR_MULT={SL_ATR_MULT} RSI({RSI_LEN})=[{RSI_LONG_MIN},{RSI_LONG_MAX}]")
+    print(f"Costs: fee={FEE_RATE} slippage={SLIPPAGE} | initial_cash={INITIAL_CASH} | risk_per_trade={RISK_PER_TRADE}\n")
 
-    # od kiedy pobierać
-    since_dt = datetime.now(timezone.utc) - timedelta(days=DAYS)
-    since_ms = int(since_dt.timestamp() * 1000)
-
-    print(f"BACKTEST: timeframe={TIMEFRAME} days={DAYS}")
-    print("Strategy: A (LONG+SHORT) EMA200 + Breakout(Donchian) + ATR SL/TP")
-    print(f"Params: EMA={EMA_LEN} Donch={BREAKOUT_LEN} ATR={ATR_LEN} SL_ATR={SL_ATR} TP_ATR={TP_ATR}")
-    print(f"Costs: fee={FEE_RATE} slippage={SLIPPAGE} | trade_usdt={TRADE_USDT}\n")
-
-    results = []
+    ex = connect_binance_public()
+    all_trades: list[Trade] = []
 
     for pair in PAIRS:
-        df = fetch_ohlcv(ex, pair, TIMEFRAME, since_ms)
-        r = backtest_pair(df, pair)
+        since_dt = datetime.now(timezone.utc) - timedelta(days=DAYS)
+        since_ms = int(since_dt.timestamp() * 1000)
 
-        results.append({
-            "pair": r["pair"],
-            "round_trips": r["round_trips"],
-            "wins": r["wins"],
-            "losses": r["losses"],
-            "win_rate": r["win_rate"],
-            "net_pnl": r["net_pnl"],
-            "profit_factor": r["profit_factor"],
-            "expectancy": r["expectancy"],
-            "max_dd": r["max_dd"],
-            "gross_profit": r["gross_profit"],
-            "gross_loss": r["gross_loss"],
-        })
+        df = fetch_ohlcv_history(ex, pair, TIMEFRAME, since_ms)
+        df = add_indicators(df)
 
-        print(
-            f'{pair}: round_trips={r["round_trips"]} '
-            f'win_rate={r["win_rate"]:.2f}% '
-            f'net_pnl={r["net_pnl"]:.4f} '
-            f'PF={r["profit_factor"]:.3f} '
-            f'exp={r["expectancy"]:.4f} '
-            f'maxDD={r["max_dd"]:.4f}'
-        )
-        write_trades_csv(pair, r["trades"])
-        print()
+        trades, final_cash, mdd = run_backtest(df, pair)
+        all_trades.extend(trades)
 
-    # =========================
-    # PODSUMOWANIE ŁĄCZNE
-    # =========================
-    if results:
-        total_pnl = sum(x["net_pnl"] for x in results)
-        total_round_trips = sum(x["round_trips"] for x in results)
-        total_wins = sum(x["wins"] for x in results)
-        total_losses = sum(x["losses"] for x in results)
-        total_trades = total_wins + total_losses
+        total_pnl = final_cash - INITIAL_CASH
+        roi = (total_pnl / INITIAL_CASH) * 100.0
 
-        win_rate = (total_wins / total_trades * 100.0) if total_trades else 0.0
+        wins = [t for t in trades if t.pnl > 0]
+        losses = [t for t in trades if t.pnl <= 0]
+        win_rate = (len(wins) / len(trades) * 100.0) if trades else 0.0
 
-        gross_profit = sum(x["gross_profit"] for x in results)
-        gross_loss = sum(x["gross_loss"] for x in results)  # ujemne
-        profit_factor = (gross_profit / abs(gross_loss)) if gross_loss != 0 else 0.0
-        expectancy = (total_pnl / total_trades) if total_trades else 0.0
+        gross_profit = sum(t.pnl for t in wins)
+        gross_loss = sum(t.pnl for t in losses)  # ujemne lub 0
+        pf = (gross_profit / abs(gross_loss)) if gross_loss < 0 else 0.0
 
-        print("\n==============================")
-        print("BACKTEST SUMMARY")
-        print("==============================")
-        print(f"Round trips: {total_round_trips}")
-        print(f"Trades:      {total_trades}")
-        print(f"Win rate:    {win_rate:.2f}%")
-        print(f"Net PnL:     {total_pnl:.4f} USDT")
-        print(f"ProfitFact:  {profit_factor:.3f}")
-        print(f"Expectancy:  {expectancy:.4f} USDT/trade")
-        print("==============================\n")
+        expectancy = (total_pnl / len(trades)) if trades else 0.0
 
+        print(f"PODSUMOWANIE DLA {pair}:")
+        print(f"  Kapitał końcowy: {final_cash:.2f} USDT ({roi:+.2f}%)")
+        print(f"  Max Drawdown:    {mdd*100:.2f}%")
+        print(f"  Liczba tradów:   {len(trades)}")
+        print(f"  Win Rate:        {win_rate:.2f}%")
+        print(f"  Profit Factor:   {pf:.2f}")
+        print(f"  Expectancy:      {expectancy:.4f} USDT/trade\n")
 
-if __name__ == "__main__":
-    main()
+    # Zapis wszystkich trade’ów do jednego CSV (opcjonalnie)
+    if TRADES_CSV:
+        write_trades(all_trades, TRADES_CSV)
+        print(f"Zapisano wszystkie transakcje do: {TRADES_CSV}")
+
+    print("\n--- KONIEC ---")
