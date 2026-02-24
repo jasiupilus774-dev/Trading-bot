@@ -23,14 +23,14 @@ SLIPPAGE = float(os.getenv("SLIPPAGE_RATE", "0.0002"))    # 0.02%
 
 # Strategia: EMA200 + Donchian + RSI + ATR SL + trailing
 EMA_LEN = int(os.getenv("EMA_LEN", "200"))
-DONCH_LEN = int(os.getenv("DONCH_LEN", "20"))
+DONCH_LEN = int(os.getenv("DONCH_LEN", "10"))
 ATR_LEN = int(os.getenv("ATR_LEN", "14"))
 SL_ATR_MULT = float(os.getenv("SL_ATR_MULT", "1.5"))
 
 # Filtry RSI (LONG)
 RSI_LEN = int(os.getenv("RSI_LEN", "14"))
-RSI_LONG_MIN = float(os.getenv("RSI_LONG_MIN", "40"))
-RSI_LONG_MAX = float(os.getenv("RSI_LONG_MAX", "55"))
+RSI_LONG_MIN = float(os.getenv("RSI_LONG_MIN", "35"))
+RSI_LONG_MAX = float(os.getenv("RSI_LONG_MAX", "65"))
 
 # CSV output (opcjonalnie)
 TRADES_CSV = os.getenv("TRADES_CSV", "backtest_trades.csv")
