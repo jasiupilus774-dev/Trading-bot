@@ -1,27 +1,24 @@
 # backtest.py
-# Backtest RSI + MACD (spot) dla wielu par, z kosztami (fee + slippage),
-# zapisuje szczegółowe transakcje do trades_<PAIR>.csv i drukuje statystyki per para + łączne.
+# Trend Following LONG-only (SPOT): EMA200 + Breakout + ATR SL/TP
+# Zapisuje transakcje do trades_<PAIR>.csv + podsumowanie łączne
 #
 # Wymagania: pip install ccxt pandas ta
 #
-# Uruchomienie lokalnie:
-#   python backtest.py
-#
-# Zmienne ENV (opcjonalne):
+# ENV (opcjonalnie):
 #   PAIRS="BTC/USDT,ETH/USDT"
 #   TIMEFRAME="1h"
 #   DAYS="180"
 #   TRADE_USDT="50"
-#   RSI_PERIOD="14"
-#   RSI_BUY="45"
-#   RSI_SELL="55"
-#   MACD_FAST="12" MACD_SLOW="26" MACD_SIGNAL="9"
+#   EMA_LEN="200"
+#   BREAKOUT_LOOKBACK="20"
+#   ATR_LEN="14"
+#   SL_ATR="1.0"
+#   TP_ATR="1.5"
 #   FEE_RATE="0.001"
 #   SLIPPAGE_RATE="0.0002"
 
 import os
 import time
-import math
 import csv
 from datetime import datetime, timezone
 
@@ -29,27 +26,24 @@ import ccxt
 import pandas as pd
 import ta
 
-
 # =========================
-# CONFIG (ENV -> default)
+# CONFIG
 # =========================
 PAIRS = [p.strip() for p in os.getenv("PAIRS", "BTC/USDT,ETH/USDT").split(",") if p.strip()]
 TIMEFRAME = os.getenv("TIMEFRAME", "1h")
 DAYS = int(os.getenv("DAYS", "180"))
 TRADE_USDT = float(os.getenv("TRADE_USDT", os.getenv("TRADE_AMOUNT_USDT", "50")))
 
-RSI_PERIOD = int(os.getenv("RSI_PERIOD", "14"))
-RSI_BUY = float(os.getenv("RSI_BUY", "45"))
-RSI_SELL = float(os.getenv("RSI_SELL", "55"))
+EMA_LEN = int(os.getenv("EMA_LEN", "200"))
+BREAKOUT_LOOKBACK = int(os.getenv("BREAKOUT_LOOKBACK", "20"))
 
-MACD_FAST = int(os.getenv("MACD_FAST", "12"))
-MACD_SLOW = int(os.getenv("MACD_SLOW", "26"))
-MACD_SIGNAL = int(os.getenv("MACD_SIGNAL", "9"))
+ATR_LEN = int(os.getenv("ATR_LEN", "14"))
+SL_ATR = float(os.getenv("SL_ATR", "1.0"))
+TP_ATR = float(os.getenv("TP_ATR", "1.5"))
 
 FEE_RATE = float(os.getenv("FEE_RATE", "0.001"))            # 0.1%
 SLIPPAGE_RATE = float(os.getenv("SLIPPAGE_RATE", "0.0002")) # 0.02%
 
-# bezpieczeństwo: na testy nie ustawiaj ogromnych wartości
 MAX_OHLCV_LIMIT = 1000
 
 
@@ -80,26 +74,20 @@ def pair_to_filename(pair: str) -> str:
 
 
 # =========================
-# EXCHANGE (public data)
+# EXCHANGE (public market data)
 # =========================
 def connect_exchange() -> ccxt.Exchange:
-    ex = ccxt.binance({
+    return ccxt.binance({
         "enableRateLimit": True,
         "options": {"defaultType": "spot"},
     })
-    return ex
 
 
 def fetch_ohlcv_all(ex: ccxt.Exchange, symbol: str, timeframe: str, since_ms: int) -> pd.DataFrame:
-    """
-    Pobiera OHLCV od since_ms do teraz, paginując.
-    Binance limit 1000 na fetch; ccxt obsługuje to.
-    """
     tf_ms = timeframe_to_ms(timeframe)
     data = []
     since = since_ms
 
-    # zabezpieczenie przed pętlą
     max_iters = 5000
     it = 0
 
@@ -113,16 +101,12 @@ def fetch_ohlcv_all(ex: ccxt.Exchange, symbol: str, timeframe: str, since_ms: in
             break
 
         data.extend(batch)
-
         last_ts = batch[-1][0]
-        # następne okno (unikamy duplikatów)
         since = last_ts + tf_ms
 
-        # jeśli jesteśmy blisko teraz, kończymy
         if since >= now_ms() - tf_ms:
             break
 
-        # rate limit
         time.sleep(ex.rateLimit / 1000)
 
     if not data:
@@ -133,41 +117,58 @@ def fetch_ohlcv_all(ex: ccxt.Exchange, symbol: str, timeframe: str, since_ms: in
     return df
 
 
+# =========================
+# INDICATORS
+# =========================
 def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
 
-    df["rsi"] = ta.momentum.RSIIndicator(df["close"], window=RSI_PERIOD).rsi()
+    df["ema200"] = ta.trend.EMAIndicator(df["close"], window=EMA_LEN).ema_indicator()
+    atr = ta.volatility.AverageTrueRange(df["high"], df["low"], df["close"], window=ATR_LEN)
+    df["atr"] = atr.average_true_range()
 
-    macd = ta.trend.MACD(
-        df["close"],
-        window_fast=MACD_FAST,
-        window_slow=MACD_SLOW,
-        window_sign=MACD_SIGNAL,
-    )
-    df["macd"] = macd.macd()
-    df["macd_signal"] = macd.macd_signal()
+    # breakout level: max high z poprzednich N świec (bez bieżącej)
+    df["hh"] = df["high"].shift(1).rolling(BREAKOUT_LOOKBACK).max()
 
     return df
 
 
 # =========================
-# STRATEGY + BACKTEST
+# BACKTEST
 # =========================
-def macd_cross_up(prev_macd, prev_sig, macd_val, sig_val) -> bool:
-    return (prev_macd < prev_sig) and (macd_val > sig_val)
+def save_trades_csv(pair: str, trades: list) -> str:
+    filename = f"trades_{pair_to_filename(pair)}.csv"
+    fields = ["ts", "pair", "side", "price", "qty", "sl", "tp", "fee", "gross", "pnl", "equity", "note"]
 
+    with open(filename, "w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=fields)
+        w.writeheader()
+        for row in trades:
+            # ensure all keys
+            for k in fields:
+                row.setdefault(k, "")
+            w.writerow(row)
 
-def macd_cross_down(prev_macd, prev_sig, macd_val, sig_val) -> bool:
-    return (prev_macd > prev_sig) and (macd_val < sig_val)
+    return filename
 
 
 def backtest_pair(df: pd.DataFrame, pair: str) -> dict:
-    """
-    Long-only: BUY gdy RSI < RSI_BUY i MACD cross up
-              SELL gdy RSI > RSI_SELL i MACD cross down
-    Wejście/wyjście na close świecy, z poślizgiem i prowizją.
-    Stała wielkość pozycji: TRADE_USDT / entry_price.
-    """
+    if df.empty or len(df) < (EMA_LEN + ATR_LEN + BREAKOUT_LOOKBACK + 5):
+        return {
+            "pair": pair,
+            "round_trips": 0,
+            "wins": 0,
+            "losses": 0,
+            "net_pnl": 0.0,
+            "gross_profit": 0.0,
+            "gross_loss": 0.0,
+            "profit_factor": 0.0,
+            "expectancy": 0.0,
+            "maxDD": 0.0,
+            "trades": [],
+        }
+
+    df = add_indicators(df).dropna().reset_index(drop=True)
     if df.empty or len(df) < 5:
         return {
             "pair": pair,
@@ -183,27 +184,12 @@ def backtest_pair(df: pd.DataFrame, pair: str) -> dict:
             "trades": [],
         }
 
-    df = add_indicators(df)
-    df = df.dropna().reset_index(drop=True)
-    if len(df) < 5:
-        return {
-            "pair": pair,
-            "round_trips": 0,
-            "wins": 0,
-            "losses": 0,
-            "net_pnl": 0.0,
-            "gross_profit": 0.0,
-            "gross_loss": 0.0,
-            "profit_factor": 0.0,
-            "expectancy": 0.0,
-            "maxDD": 0.0,
-            "trades": [],
-        }
-
     in_pos = False
-    entry_price = None
+    entry_price = 0.0
     qty = 0.0
-    entry_fees = 0.0
+    sl = 0.0
+    tp = 0.0
+    entry_fee = 0.0
     entry_ts = None
 
     trades = []
@@ -218,30 +204,97 @@ def backtest_pair(df: pd.DataFrame, pair: str) -> dict:
     net_pnl = 0.0
     round_trips = 0
 
-    for i in range(1, len(df)):
-        prev = df.iloc[i - 1]
-        cur = df.iloc[i]
+    for i in range(len(df)):
+        row = df.iloc[i]
+        ts = int(row["ts"])
+        close = float(row["close"])
+        ema200 = float(row["ema200"])
+        atr = float(row["atr"])
+        hh = float(row["hh"])
 
-        price = float(cur["close"])
-        rsi = float(cur["rsi"])
-        prev_macd = float(prev["macd"])
-        prev_sig = float(prev["macd_signal"])
-        macd_val = float(cur["macd"])
-        sig_val = float(cur["macd_signal"])
+        # Filtr trendu: tylko LONG gdy close > EMA200
+        uptrend = close > ema200
 
-        buy_sig = (rsi < RSI_BUY) and macd_cross_up(prev_macd, prev_sig, macd_val, sig_val)
-        sell_sig = (rsi > RSI_SELL) and macd_cross_down(prev_macd, prev_sig, macd_val, sig_val)
+        # Wejście: breakout
+        buy_sig = uptrend and (close > hh)
 
-        ts = int(cur["ts"])
+        # Jeśli w pozycji: sprawdzamy SL/TP na podstawie close (konserwatywnie)
+        if in_pos:
+            # exit reason
+            reason = None
+            exit_price_raw = close
 
-        # ENTRY
+            if close <= sl:
+                reason = "SL"
+                exit_price_raw = sl  # konserwatywnie egzekucja na SL
+            elif close >= tp:
+                reason = "TP"
+                exit_price_raw = tp  # konserwatywnie egzekucja na TP
+
+            if reason is not None:
+                # sprzedajemy gorzej (slippage w dół)
+                exit_price = exit_price_raw * (1.0 - SLIPPAGE_RATE)
+                exit_value = exit_price * qty
+                exit_fee = exit_value * FEE_RATE
+
+                gross = (exit_price - entry_price) * qty
+                fees = entry_fee + exit_fee
+                pnl = gross - fees
+
+                net_pnl += pnl
+                equity += pnl
+
+                peak = max(peak, equity)
+                dd = equity - peak
+                max_dd = min(max_dd, dd)
+
+                if pnl >= 0:
+                    wins += 1
+                    gross_profit += pnl
+                else:
+                    losses += 1
+                    gross_loss += pnl  # ujemne
+
+                round_trips += 1
+
+                trades.append({
+                    "ts": iso_utc(ts),
+                    "pair": pair,
+                    "side": f"SELL_{reason}",
+                    "price": exit_price,
+                    "qty": qty,
+                    "sl": sl,
+                    "tp": tp,
+                    "fee": exit_fee,
+                    "gross": gross,
+                    "pnl": pnl,
+                    "equity": equity,
+                    "note": f"entry={iso_utc(entry_ts)}",
+                })
+
+                # reset
+                in_pos = False
+                entry_price = 0.0
+                qty = 0.0
+                sl = 0.0
+                tp = 0.0
+                entry_fee = 0.0
+                entry_ts = None
+
+                continue  # idziemy do następnej świecy
+
+        # Entry tylko jeśli nie jesteśmy w pozycji
         if (not in_pos) and buy_sig:
             # kupujemy gorzej (slippage w górę)
-            entry_price = price * (1.0 + SLIPPAGE_RATE)
+            entry_price = close * (1.0 + SLIPPAGE_RATE)
             qty = TRADE_USDT / entry_price
-            # fee od wartości transakcji
+
+            # SL/TP o ATR (od entry)
+            sl = entry_price - (atr * SL_ATR)
+            tp = entry_price + (atr * TP_ATR)
+
             entry_value = entry_price * qty
-            entry_fees = entry_value * FEE_RATE
+            entry_fee = entry_value * FEE_RATE
             entry_ts = ts
 
             trades.append({
@@ -250,66 +303,16 @@ def backtest_pair(df: pd.DataFrame, pair: str) -> dict:
                 "side": "BUY",
                 "price": entry_price,
                 "qty": qty,
-                "rsi": rsi,
-                "macd": macd_val,
-                "macd_signal": sig_val,
-                "fee": entry_fees,
+                "sl": sl,
+                "tp": tp,
+                "fee": entry_fee,
+                "gross": "",
                 "pnl": "",
                 "equity": equity,
-                "note": "RSI+MACD",
+                "note": f"EMA{EMA_LEN} breakout{BREAKOUT_LOOKBACK} ATR{ATR_LEN}",
             })
+
             in_pos = True
-            continue
-
-        # EXIT
-        if in_pos and sell_sig:
-            # sprzedajemy gorzej (slippage w dół)
-            exit_price = price * (1.0 - SLIPPAGE_RATE)
-            exit_value = exit_price * qty
-            exit_fee = exit_value * FEE_RATE
-
-            gross = (exit_price - entry_price) * qty
-            fees = entry_fees + exit_fee
-            pnl = gross - fees
-
-            net_pnl += pnl
-            equity += pnl
-
-            # drawdown
-            peak = max(peak, equity)
-            dd = equity - peak
-            max_dd = min(max_dd, dd)
-
-            if pnl >= 0:
-                wins += 1
-                gross_profit += pnl
-            else:
-                losses += 1
-                gross_loss += pnl  # ujemne
-
-            round_trips += 1
-
-            trades.append({
-                "ts": iso_utc(ts),
-                "pair": pair,
-                "side": "SELL",
-                "price": exit_price,
-                "qty": qty,
-                "rsi": rsi,
-                "macd": macd_val,
-                "macd_signal": sig_val,
-                "fee": exit_fee,
-                "pnl": pnl,
-                "equity": equity,
-                "note": f"EXIT | entry={iso_utc(entry_ts)}",
-            })
-
-            # reset
-            in_pos = False
-            entry_price = None
-            qty = 0.0
-            entry_fees = 0.0
-            entry_ts = None
 
     total_trades = wins + losses
     profit_factor = abs(gross_profit / gross_loss) if gross_loss != 0 else 0.0
@@ -330,36 +333,13 @@ def backtest_pair(df: pd.DataFrame, pair: str) -> dict:
     }
 
 
-def save_trades_csv(pair: str, trades: list) -> str:
-    filename = f"trades_{pair_to_filename(pair)}.csv"
-    if not trades:
-        # zapis pustego nagłówka też jest ok
-        fields = ["ts", "pair", "side", "price", "qty", "rsi", "macd", "macd_signal", "fee", "pnl", "equity", "note"]
-        with open(filename, "w", newline="") as f:
-            w = csv.DictWriter(f, fieldnames=fields)
-            w.writeheader()
-        return filename
-
-    fields = list(trades[0].keys())
-    with open(filename, "w", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=fields)
-        w.writeheader()
-        for row in trades:
-            w.writerow(row)
-    return filename
-
-
-# =========================
-# MAIN
-# =========================
 def main():
     print(f"BACKTEST: timeframe={TIMEFRAME} days={DAYS}")
-    print(f"Params: RSI({RSI_PERIOD}) BUY<{RSI_BUY} SELL>{RSI_SELL} | MACD {MACD_FAST}/{MACD_SLOW}/{MACD_SIGNAL}")
+    print(f"Strategy: LONG-only EMA{EMA_LEN} + Breakout({BREAKOUT_LOOKBACK}) + ATR SL/TP")
+    print(f"ATR: len={ATR_LEN} SL_ATR={SL_ATR} TP_ATR={TP_ATR}")
     print(f"Costs: fee={FEE_RATE} slippage={SLIPPAGE_RATE} | trade_usdt={TRADE_USDT}\n")
 
     ex = connect_exchange()
-
-    tf_ms = timeframe_to_ms(TIMEFRAME)
     since_ms = now_ms() - DAYS * 86_400_000
 
     results = []
@@ -369,11 +349,15 @@ def main():
             df = fetch_ohlcv_all(ex, pair, TIMEFRAME, since_ms)
             res = backtest_pair(df, pair)
 
-            # zapis transakcji
             out = save_trades_csv(pair, res["trades"])
-            print(f"{pair}: round_trips={res['round_trips']} net_pnl={res['net_pnl']:.4f} "
-                  f"win_rate={(res['wins']/(res['wins']+res['losses'])*100) if (res['wins']+res['losses'])>0 else 0:.2f}% "
-                  f"PF={res['profit_factor']:.3f} exp={res['expectancy']:.4f} maxDD={res['maxDD']:.4f}")
+            trades_n = res["wins"] + res["losses"]
+            win_rate = (res["wins"] / trades_n * 100) if trades_n > 0 else 0.0
+
+            print(
+                f"{pair}: round_trips={res['round_trips']} trades={trades_n} "
+                f"win_rate={win_rate:.2f}% net_pnl={res['net_pnl']:.4f} "
+                f"PF={res['profit_factor']:.3f} exp={res['expectancy']:.4f} maxDD={res['maxDD']:.4f}"
+            )
             print(f"-> zapisano {out}\n")
 
             results.append(res)
@@ -394,7 +378,7 @@ def main():
         win_rate = (total_wins / total_trades * 100) if total_trades > 0 else 0
 
         gross_profit = sum(r.get("gross_profit", 0) for r in results)
-        gross_loss = sum(r.get("gross_loss", 0) for r in results)  # ujemne
+        gross_loss = sum(r.get("gross_loss", 0) for r in results)
         profit_factor = abs(gross_profit / gross_loss) if gross_loss != 0 else 0
 
         expectancy = total_pnl / total_trades if total_trades > 0 else 0
