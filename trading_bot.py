@@ -85,16 +85,7 @@ def save_state(state):
         json.dump(state, f)
 
 def append_trade(row):
-    os.makedirs(os.path.dirname(TRADES_CSV) or ".", exist_ok=True)
-    exists = os.path.exists(TRADES_CSV)
-    fields = ["ts", "pair", "side", "price", "qty", "entry", "sl", "tp", "gross", "fees", "pnl", "rsi", "trend", "mode"]
-    with open(TRADES_CSV, "a", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=fields)
-        if not exists:
-            w.writeheader()
-        for k in fields:
-            row.setdefault(k, None)
-        w.writerow(row)
+    log.info(f"📊 TRADE EVENT: {row}")
 
 # =========================
 # BINANCE (CCXT)
