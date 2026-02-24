@@ -13,7 +13,7 @@ import ta
 # =========================
 PAIRS = ["BTC/USDT", "ETH/USDT"]
 
-TIMEFRAME = os.getenv("TIMEFRAME", "1h")
+TIMEFRAME = os.getenv("TIMEFRAME", "15m")
 DAYS = int(os.getenv("DAYS", "180"))
 
 TRADE_USDT = float(os.getenv("TRADE_USDT", "50"))
@@ -24,7 +24,7 @@ SLIPPAGE = float(os.getenv("SLIPPAGE_RATE", "0.0002"))    # 0.02%
 EMA_LEN = int(os.getenv("EMA_LEN", "200"))
 
 # Breakout (Donchian)
-BREAKOUT_LEN = int(os.getenv("BREAKOUT_LEN", "20"))
+BREAKOUT_LEN = int(os.getenv("BREAKOUT_LEN", "10"))
 
 # ATR SL/TP
 ATR_LEN = int(os.getenv("ATR_LEN", "14"))
