@@ -1,40 +1,50 @@
 import os
-import csv
 import math
 import pandas as pd
 import ta
 import ccxt
-from dataclasses import dataclass
+from dataclasses import dataclass, asdict
 from datetime import datetime, timedelta, timezone
 
 # =========================
-# CONFIGURATION (SPOT LONG-only)
+# STRATEGY A (SPOT LONG-only)
+# Mean Reversion w trendzie (EMA200 filter)
 # =========================
+
+# --- Settings ---
 PAIRS = ["BTC/USDT", "ETH/USDT"]
+TIMEFRAME = "1h"
+DAYS = 180
 
-TIMEFRAME = os.getenv("TIMEFRAME", "1h")   # "15m" albo "1h"
-DAYS = int(os.getenv("DAYS", "180"))
+INITIAL_CASH = 1000.0
+RISK_PER_TRADE = 0.01        # 1% kapitału ryzykowane na trade (na SL)
+FEE_RATE = 0.001             # 0.1%
+SLIPPAGE = 0.0002            # 0.02%
 
-INITIAL_CASH = float(os.getenv("INITIAL_CASH", "1000.0"))
-RISK_PER_TRADE = float(os.getenv("RISK_PER_TRADE", "0.01"))  # 1% ryzyka na trade
+# Trend filter
+EMA_TREND_LEN = 200
 
-FEE_RATE = float(os.getenv("FEE_RATE", "0.001"))          # 0.1%
-SLIPPAGE = float(os.getenv("SLIPPAGE_RATE", "0.0002"))    # 0.02%
+# Mean reversion tools
+EMA_MEAN_LEN = 20
+RSI_LEN = 14
+BB_LEN = 20
+BB_STD = 2.0
 
-# Strategia: EMA200 + Donchian + RSI + ATR SL + trailing
-EMA_LEN = int(os.getenv("EMA_LEN", "200"))
-DONCH_LEN = int(os.getenv("DONCH_LEN", "10"))
-ATR_LEN = int(os.getenv("ATR_LEN", "14"))
-SL_ATR_MULT = float(os.getenv("SL_ATR_MULT", "1.5"))
+# Volatility
+ATR_LEN = 14
 
-# Filtry RSI (LONG)
-RSI_LEN = int(os.getenv("RSI_LEN", "14"))
-RSI_LONG_MIN = float(os.getenv("RSI_LONG_MIN", "35"))
-RSI_LONG_MAX = float(os.getenv("RSI_LONG_MAX", "65"))
+# Risk logic
+SL_ATR_MULT = 1.5            # SL = 1.5 * ATR
+TP_ATR_MULT = 1.0            # TP = 1.0 * ATR (często trafia przy MR)
+EXIT_ON_EMA20 = True         # dodatkowe wyjście: zamknij jak wróci powyżej EMA20
 
-# CSV output (opcjonalnie)
-TRADES_CSV = os.getenv("TRADES_CSV", "backtest_trades.csv")
+# Entry thresholds
+RSI_ENTRY_MAX = 35.0         # wejście tylko gdy RSI <= 35
+MIN_BARS = 250               # żeby EMA200/ATR/BB miały sens
 
+
+OUTPUT_DIR = "output"
+os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 @dataclass
 class Trade:
@@ -46,250 +56,279 @@ class Trade:
     exit: float
     qty: float
     pnl: float
+    fees: float
     reason: str
+    rsi: float
+    atr: float
+    ema200: float
 
 
 # =========================
-# UTILS
+# Data
 # =========================
-def tf_to_ms(tf: str) -> int:
-    unit = tf[-1]
-    n = int(tf[:-1])
-    if unit == "m":
-        return n * 60_000
-    if unit == "h":
-        return n * 60 * 60_000
-    if unit == "d":
-        return n * 24 * 60 * 60_000
-    raise ValueError(f"Unknown timeframe: {tf}")
-
-
-def ensure_dir_for_file(path: str):
-    d = os.path.dirname(path)
-    if d:
-        os.makedirs(d, exist_ok=True)
-
-
-def connect_binance_public():
-    return ccxt.binance({"enableRateLimit": True, "options": {"defaultType": "spot"}})
-
-
-def fetch_ohlcv_history(ex, pair: str, timeframe: str, since_ms: int) -> pd.DataFrame:
-    """
-    Pobiera OHLCV od since_ms do teraz, z paginacją (ważne).
-    """
-    all_rows = []
-    limit = 1000
-    now_ms = ex.milliseconds()
-    tf_ms = tf_to_ms(timeframe)
-
-    cur = since_ms
-    while True:
-        batch = ex.fetch_ohlcv(pair, timeframe=timeframe, since=cur, limit=limit)
-        if not batch:
-            break
-
-        all_rows.extend(batch)
-        last_ts = batch[-1][0]
-
-        # przesuwamy o jedną świecę do przodu
-        cur = last_ts + tf_ms
-
-        if cur >= now_ms:
-            break
-
-        # jeśli dostaliśmy mniej niż limit, kończymy
-        if len(batch) < limit:
-            break
-
-    df = pd.DataFrame(all_rows, columns=["ts", "open", "high", "low", "close", "volume"])
+def fetch_ohlcv(pair: str) -> pd.DataFrame:
+    ex = ccxt.binance({"enableRateLimit": True})
+    since = int((datetime.now(timezone.utc) - timedelta(days=DAYS)).timestamp() * 1000)
+    rows = ex.fetch_ohlcv(pair, timeframe=TIMEFRAME, since=since)
+    df = pd.DataFrame(rows, columns=["ts", "open", "high", "low", "close", "volume"])
     df["ts"] = pd.to_datetime(df["ts"], unit="ms", utc=True)
-    df = df.drop_duplicates(subset=["ts"]).sort_values("ts").reset_index(drop=True)
     return df
 
 
-# =========================
-# INDICATORS
-# =========================
 def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
-    df["ema200"] = ta.trend.EMAIndicator(df["close"], window=EMA_LEN).ema_indicator()
 
-    # Donchian liczymy i przesuwamy o 1 świecę, żeby nie używać bieżącej
-    df["donch_high"] = df["high"].rolling(DONCH_LEN).max().shift(1)
-    df["donch_low"] = df["low"].rolling(DONCH_LEN).min().shift(1)
-
-    df["atr"] = ta.volatility.AverageTrueRange(
-        df["high"], df["low"], df["close"], window=ATR_LEN
-    ).average_true_range()
+    df["ema200"] = ta.trend.EMAIndicator(df["close"], window=EMA_TREND_LEN).ema_indicator()
+    df["ema20"] = ta.trend.EMAIndicator(df["close"], window=EMA_MEAN_LEN).ema_indicator()
 
     df["rsi"] = ta.momentum.RSIIndicator(df["close"], window=RSI_LEN).rsi()
+
+    bb = ta.volatility.BollingerBands(close=df["close"], window=BB_LEN, window_dev=BB_STD)
+    df["bb_low"] = bb.bollinger_lband()
+    df["bb_mid"] = bb.bollinger_mavg()
+    df["bb_high"] = bb.bollinger_hband()
+
+    atr = ta.volatility.AverageTrueRange(df["high"], df["low"], df["close"], window=ATR_LEN)
+    df["atr"] = atr.average_true_range()
+
     return df
 
 
 # =========================
-# BACKTEST ENGINE (LONG-only)
+# Backtest core
 # =========================
+def compute_max_drawdown(equity_curve: pd.Series) -> float:
+    peak = equity_curve.cummax()
+    dd = (peak - equity_curve) / peak
+    return float(dd.max()) if len(dd) else 0.0
+
+
 def run_backtest(df: pd.DataFrame, pair: str):
     cash = INITIAL_CASH
-    peak_cash = INITIAL_CASH
-    max_drawdown = 0.0
+    equity = []
+    trades = []
 
     in_pos = False
-    entry = None
-    qty = 0.0
-    sl = None
+    entry = qty = sl = tp = None
     entry_ts = None
 
-    trades: list[Trade] = []
+    # iterujemy od 1 żeby móc używać prev bar
+    for i in range(1, len(df)):
+        curr = df.iloc[i]
+        prev = df.iloc[i - 1]
 
-    # Warmup
-    warmup = max(EMA_LEN, DONCH_LEN, ATR_LEN, RSI_LEN) + 5
-    if len(df) <= warmup:
-        return trades, cash, max_drawdown
+        # equity mark-to-market
+        equity.append(cash if not in_pos else cash)  # w tej wersji equity = cash (bez MTM); DD liczymy po zamknięciach
 
-    for i in range(warmup + 1, len(df)):
-        prev = df.iloc[i - 1]  # sygnał na zamknięciu prev
-        cur = df.iloc[i]       # wejście/wyjście na open cur (model)
+        # pomijamy, jeśli wskaźniki jeszcze nie gotowe
+        if any(pd.isna(prev[x]) for x in ["ema200", "ema20", "rsi", "bb_low", "atr"]):
+            continue
 
-        # --- EXIT (jeśli w pozycji)
+        # =========================
+        # EXIT LOGIC (intrabar)
+        # =========================
         if in_pos:
             exit_price = None
             reason = None
 
-            # SL intrabar: jeśli low <= sl, wyjście po sl (z poślizgiem)
-            if cur["low"] <= sl:
-                exit_raw = float(sl)
-                exit_price = exit_raw * (1 - SLIPPAGE)
+            # konserwatywnie: jeśli w tej samej świecy dotknęło i SL i TP → liczymy SL
+            hit_sl = curr["low"] <= sl
+            hit_tp = curr["high"] >= tp
+
+            if hit_sl:
+                exit_price = sl
                 reason = "SL"
-            else:
-                # trailing SL: podciągamy SL do prev.donch_low (konserwatywnie)
-                if not pd.isna(prev["donch_low"]):
-                    sl = max(sl, float(prev["donch_low"]))
+            elif hit_tp:
+                exit_price = tp
+                reason = "TP"
+            elif EXIT_ON_EMA20 and curr["close"] >= curr["ema20"]:
+                exit_price = curr["close"]
+                reason = "EMA20"
 
-            if reason:
-                gross = (exit_price - entry) * qty
-                fees = (entry * qty + exit_price * qty) * FEE_RATE
+            if reason is not None:
+                # wyjście ze slippage
+                real_exit = exit_price * (1 - SLIPPAGE)
+
+                gross = (real_exit - entry) * qty
+                fees = (entry * qty + real_exit * qty) * FEE_RATE
                 pnl = gross - fees
-
                 cash += pnl
-                peak_cash = max(peak_cash, cash)
-                dd = (peak_cash - cash) / peak_cash if peak_cash > 0 else 0.0
-                max_drawdown = max(max_drawdown, dd)
 
                 trades.append(
                     Trade(
                         ts_entry=entry_ts.isoformat(),
-                        ts_exit=cur["ts"].isoformat(),
+                        ts_exit=curr["ts"].isoformat(),
                         pair=pair,
                         side="LONG",
                         entry=float(entry),
-                        exit=float(exit_price),
+                        exit=float(real_exit),
                         qty=float(qty),
                         pnl=float(pnl),
+                        fees=float(fees),
                         reason=reason,
+                        rsi=float(prev["rsi"]),
+                        atr=float(prev["atr"]),
+                        ema200=float(prev["ema200"]),
                     )
                 )
 
                 in_pos = False
-                entry = None
-                qty = 0.0
-                sl = None
+                entry = qty = sl = tp = None
                 entry_ts = None
 
-        # --- ENTRY (tylko jeśli flat)
+        # =========================
+        # ENTRY LOGIC
+        # =========================
         if not in_pos:
-            if pd.isna(prev["ema200"]) or pd.isna(prev["donch_high"]) or pd.isna(prev["atr"]) or pd.isna(prev["rsi"]):
-                continue
+            # Trend UP: cena powyżej EMA200
+            trend_up = prev["close"] > prev["ema200"]
 
-            # Trend + RSI pullback + breakout
-            is_long = (
-                prev["close"] > prev["ema200"]
-                and RSI_LONG_MIN <= prev["rsi"] <= RSI_LONG_MAX
-                and prev["close"] >= prev["donch_high"]
-            )
+            # Mean reversion trigger:
+            # 1) RSI niskie
+            # 2) cena poniżej dolnego BB (przeciągnięcie)
+            mr_trigger = (prev["rsi"] <= RSI_ENTRY_MAX) and (prev["close"] <= prev["bb_low"])
 
-            if is_long:
-                entry_raw = float(cur["open"])
-                entry = entry_raw * (1 + SLIPPAGE)
+            if trend_up and mr_trigger:
+                # wejdź na open następnej świecy (curr.open) + slippage
+                entry = float(curr["open"]) * (1 + SLIPPAGE)
 
-                sl_dist = float(prev["atr"]) * SL_ATR_MULT
-                if sl_dist <= 0:
+                # SL/TP na ATR z poprzedniej świecy (żeby nie patrzeć w przyszłość)
+                atr_val = float(prev["atr"])
+                if atr_val <= 0:
                     continue
 
-                # risk-based sizing (bez lewara): ryzyko 1% kapitału
+                sl_dist = atr_val * SL_ATR_MULT
+                tp_dist = atr_val * TP_ATR_MULT
+
+                sl = entry - sl_dist
+                tp = entry + tp_dist
+
+                # risk-based position sizing
                 risk_usdt = cash * RISK_PER_TRADE
+                # qty tak, aby strata do SL = risk_usdt
                 qty = risk_usdt / sl_dist
 
-                # ograniczenie do posiadanego cash
+                # SPOT: bez lewara → wartość pozycji nie może przekroczyć cash
                 max_qty = cash / entry
                 qty = min(qty, max_qty)
 
-                # zabezpieczenie: jeśli qty jest praktycznie 0
-                if qty <= 0:
+                # jeżeli qty za małe (np. przez mały cash), pomiń
+                if qty <= 0 or math.isclose(qty, 0.0):
+                    entry = qty = sl = tp = None
                     continue
 
-                sl = entry - sl_dist
-                entry_ts = cur["ts"]
                 in_pos = True
+                entry_ts = curr["ts"]
 
-    return trades, cash, max_drawdown
+    # equity curve po zamknięciach
+    if not equity:
+        equity = [INITIAL_CASH]
+
+    equity_series = pd.Series(equity)
+    mdd = compute_max_drawdown(equity_series)
+
+    return trades, cash, mdd
 
 
-def write_trades(trades: list[Trade], path: str):
-    ensure_dir_for_file(path)
-    with open(path, "w", newline="") as f:
-        w = csv.writer(f)
-        w.writerow(["ts_entry", "ts_exit", "pair", "side", "entry", "exit", "qty", "pnl", "reason"])
-        for t in trades:
-            w.writerow([t.ts_entry, t.ts_exit, t.pair, t.side, t.entry, t.exit, t.qty, t.pnl, t.reason])
+def summarize(pair: str, trades, final_cash: float, mdd: float):
+    total_pnl = final_cash - INITIAL_CASH
+    roi = (total_pnl / INITIAL_CASH) * 100
+
+    n = len(trades)
+    wins = sum(1 for t in trades if t.pnl > 0)
+    losses = n - wins
+    win_rate = (wins / n * 100) if n > 0 else 0.0
+
+    gross_profit = sum(t.pnl for t in trades if t.pnl > 0)
+    gross_loss = sum(t.pnl for t in trades if t.pnl < 0)
+    profit_factor = (gross_profit / abs(gross_loss)) if gross_loss < 0 else 0.0
+
+    expectancy = (total_pnl / n) if n > 0 else 0.0
+
+    print(f"\nPODSUMOWANIE DLA {pair}:")
+    print(f"  Kapitał końcowy: {final_cash:.2f} USDT ({roi:+.2f}%)")
+    print(f"  Max Drawdown:    {mdd*100:.2f}%")
+    print(f"  Liczba tradów:   {n}")
+    print(f"  Win Rate:        {win_rate:.2f}%")
+    print(f"  Profit Factor:   {profit_factor:.2f}")
+    print(f"  Expectancy:      {expectancy:.4f} USDT/trade")
+
+    return {
+        "pair": pair,
+        "trades": n,
+        "wins": wins,
+        "losses": losses,
+        "win_rate": win_rate,
+        "net_pnl": total_pnl,
+        "roi": roi,
+        "pf": profit_factor,
+        "expectancy": expectancy,
+        "mdd": mdd,
+        "final_cash": final_cash,
+    }
 
 
-# =========================
-# RUN + REPORT
-# =========================
-if __name__ == "__main__":
-    print(f"--- START BACKTESTU (SPOT LONG-only) | {DAYS} dni | TF: {TIMEFRAME} ---")
-    print(f"Params: EMA={EMA_LEN} Donch={DONCH_LEN} ATR={ATR_LEN} SL_ATR_MULT={SL_ATR_MULT} RSI({RSI_LEN})=[{RSI_LONG_MIN},{RSI_LONG_MAX}]")
-    print(f"Costs: fee={FEE_RATE} slippage={SLIPPAGE} | initial_cash={INITIAL_CASH} | risk_per_trade={RISK_PER_TRADE}\n")
+def save_trades_csv(all_trades):
+    if not all_trades:
+        print("\nBrak transakcji — nie zapisuję CSV.")
+        return None
 
-    ex = connect_binance_public()
-    all_trades: list[Trade] = []
+    df = pd.DataFrame([asdict(t) for t in all_trades])
+    path = os.path.join(OUTPUT_DIR, "backtest_trades.csv")
+    df.to_csv(path, index=False)
+    print(f"\nZapisano wszystkie transakcje do: {path}")
+    return path
+
+
+def main():
+    print(f"\n--- START BACKTESTU (SPOT LONG-only) | {DAYS} dni | TF: {TIMEFRAME} ---")
+    print("Strategia A: Mean Reversion w trendzie (EMA200) + BB(20,2) + RSI")
+    print(f"Params: EMA200={EMA_TREND_LEN} EMA20={EMA_MEAN_LEN} RSI<={RSI_ENTRY_MAX} BB={BB_LEN},{BB_STD}")
+    print(f"Risk: SL={SL_ATR_MULT}*ATR TP={TP_ATR_MULT}*ATR | fee={FEE_RATE} slippage={SLIPPAGE} | risk_per_trade={RISK_PER_TRADE}\n")
+
+    results = []
+    all_trades = []
 
     for pair in PAIRS:
-        since_dt = datetime.now(timezone.utc) - timedelta(days=DAYS)
-        since_ms = int(since_dt.timestamp() * 1000)
-
-        df = fetch_ohlcv_history(ex, pair, TIMEFRAME, since_ms)
+        df = fetch_ohlcv(pair)
         df = add_indicators(df)
+
+        if len(df) < MIN_BARS:
+            print(f"{pair}: za mało danych ({len(df)} barów).")
+            continue
 
         trades, final_cash, mdd = run_backtest(df, pair)
         all_trades.extend(trades)
+        results.append(summarize(pair, trades, final_cash, mdd))
 
-        total_pnl = final_cash - INITIAL_CASH
-        roi = (total_pnl / INITIAL_CASH) * 100.0
+    # ===== TOTAL SUMMARY =====
+    if results:
+        total_net = sum(r["net_pnl"] for r in results)
+        total_trades = sum(r["trades"] for r in results)
+        total_wins = sum(r["wins"] for r in results)
+        total_losses = sum(r["losses"] for r in results)
 
-        wins = [t for t in trades if t.pnl > 0]
-        losses = [t for t in trades if t.pnl <= 0]
-        win_rate = (len(wins) / len(trades) * 100.0) if trades else 0.0
+        total_win_rate = (total_wins / total_trades * 100) if total_trades > 0 else 0.0
 
-        gross_profit = sum(t.pnl for t in wins)
-        gross_loss = sum(t.pnl for t in losses)  # ujemne lub 0
-        pf = (gross_profit / abs(gross_loss)) if gross_loss < 0 else 0.0
+        gross_profit = sum(max(0.0, t.pnl) for t in all_trades)
+        gross_loss = sum(min(0.0, t.pnl) for t in all_trades)
+        total_pf = (gross_profit / abs(gross_loss)) if gross_loss < 0 else 0.0
 
-        expectancy = (total_pnl / len(trades)) if trades else 0.0
+        total_expectancy = (total_net / total_trades) if total_trades > 0 else 0.0
 
-        print(f"PODSUMOWANIE DLA {pair}:")
-        print(f"  Kapitał końcowy: {final_cash:.2f} USDT ({roi:+.2f}%)")
-        print(f"  Max Drawdown:    {mdd*100:.2f}%")
-        print(f"  Liczba tradów:   {len(trades)}")
-        print(f"  Win Rate:        {win_rate:.2f}%")
-        print(f"  Profit Factor:   {pf:.2f}")
-        print(f"  Expectancy:      {expectancy:.4f} USDT/trade\n")
+        print("\n==============================")
+        print("BACKTEST SUMMARY (TOTAL)")
+        print("==============================")
+        print(f"Trades:       {total_trades}")
+        print(f"Win rate:     {total_win_rate:.2f}%")
+        print(f"Net PnL:      {total_net:.4f} USDT")
+        print(f"ProfitFactor: {total_pf:.3f}")
+        print(f"Expectancy:   {total_expectancy:.4f} USDT/trade")
+        print("==============================\n")
 
-    # Zapis wszystkich trade’ów do jednego CSV (opcjonalnie)
-    if TRADES_CSV:
-        write_trades(all_trades, TRADES_CSV)
-        print(f"Zapisano wszystkie transakcje do: {TRADES_CSV}")
+    save_trades_csv(all_trades)
+    print("--- KONIEC ---\n")
 
-    print("\n--- KONIEC ---")
+
+if __name__ == "__main__":
+    main()
