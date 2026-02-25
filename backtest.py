@@ -10,9 +10,9 @@ from datetime import datetime, timedelta, timezone
 # =========================
 # CONFIG (PUBLIC / no keys)
 # =========================
-PAIRS = ["BTC/USDT", "ETH/USDT"]
+PAIRS = ["BTC/USDT"]
 TIMEFRAME = "1h"
-DAYS = 180
+DAYS = 720
 
 INITIAL_CASH = 1000.0
 RISK_PER_TRADE = 0.01          # 1% equity risk per trade
