@@ -21,7 +21,7 @@ SLIPPAGE = 0.0002              # 2 bps
 
 # Strategy: EMA200 trend + Donchian breakout + ATR squeeze filter + ATR SL/TP
 EMA_LEN = 200
-DONCH_LEN = 20
+DONCH_LEN = 10
 ATR_LEN = 14
 
 # SL/TP using ATR
@@ -30,7 +30,7 @@ TP_ATR_MULT = 1.5
 
 # Volatility compression filter (ATR% of price)
 ATR_PCT_LEN = 50               # lookback for "low vol" regime
-ATR_PCT_Q = 0.25               # 0.25 = bottom quartile (more strict). Try 0.40 if too few trades.
+ATR_PCT_Q = 0.40               # 0.25 = bottom quartile (more strict). Try 0.40 if too few trades.
 
 # If you want long-only / short-only:
 ALLOW_LONG = True
