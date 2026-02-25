@@ -26,7 +26,7 @@ ATR_LEN = 14
 
 # SL/TP using ATR
 SL_ATR_MULT = 1.0
-TP_ATR_MULT = 1.5
+TP_ATR_MULT = 2.0
 
 # Volatility compression filter (ATR% of price)
 ATR_PCT_LEN = 50               # lookback for "low vol" regime
@@ -34,7 +34,7 @@ ATR_PCT_Q = 0.40               # 0.25 = bottom quartile (more strict). Try 0.40 
 
 # If you want long-only / short-only:
 ALLOW_LONG = True
-ALLOW_SHORT = True
+ALLOW_SHORT = False
 
 # Output
 OUT_DIR = "output"
